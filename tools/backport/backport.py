@@ -3,8 +3,10 @@
 backport.py - GitLab/Jira/GM2 Backport Automation
 
 Usage:
-    python backport.py --mr <MR_IID>           # Phase 1: read-only validation
-    python backport.py --mr <MR_IID> --execute  # Phase 2: full execution
+    python backport.py --mr <MR_IID>                       # Phase 1: read-only validation
+    python backport.py --mr <MR_IID> --inspect-ids         # Inspect modified test IDs from diffs/scenarios
+    python backport.py --mr <MR_IID> --execute             # Phase 2: full execution
+    python backport.py --mr <MR_IID> --execute --non-interactive # CI/CD headless execution
 
 Environment Variables Required:
     GITLAB_TOKEN      - GitLab personal access token
@@ -15,6 +17,7 @@ Environment Variables Required:
     OPENSEARCH_URL    - e.g. https://autoinfra-es.vaultdev.com:9200
 """
 import urllib3
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 import argparse
@@ -22,6 +25,7 @@ import os
 import re
 import sys
 import json
+import urllib.parse
 from datetime import datetime, timezone
 import requests
 
@@ -40,8 +44,6 @@ JIRA_HEADERS = {
 OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "https://autoinfra-es.vaultdev.com:9200")
 
 MANAGER_NAME = "Vinil Pokala"
-JIRA_TRANSITION_PASSED_GM2 = "751"   # Running on GM2 → GM Data Creation
-JIRA_TRANSITION_DATA_CREATED = "761"  # GM Data Creation → MR to GM
 
 GITLAB_HEADERS = {
     "PRIVATE-TOKEN": GITLAB_TOKEN,
@@ -73,6 +75,14 @@ def gitlab_get(path, params=None):
         err(f"GitLab 404: {url}")
     resp.raise_for_status()
     return resp.json()
+
+
+def gitlab_get_raw(path, params=None):
+    """Fetch raw text content from GitLab API."""
+    url = f"{GITLAB_URL}/api/v4{path}"
+    resp = requests.get(url, headers=GITLAB_HEADERS, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
 
 def gitlab_post(path, payload):
@@ -116,7 +126,7 @@ def opensearch_query(payload):
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Fetch MR Metadata
+# Step 1: Scenario Isolation & ID Extraction Logic
 # ---------------------------------------------------------------------------
 
 def fetch_mr(project_id_encoded, mr_iid):
@@ -134,7 +144,178 @@ def extract_jira_id(mr_title):
     return match.group(0)
 
 
+def fetch_raw_file_content(project_id_encoded, file_path, ref_sha):
+    """Fetch raw file content at a specific commit ref from GitLab."""
+    encoded_path = urllib.parse.quote(file_path, safe="")
+    path = f"/projects/{project_id_encoded}/repository/files/{encoded_path}/raw"
+    try:
+        return gitlab_get_raw(path, params={"ref": ref_sha})
+    except Exception as e:
+        warn(f"Could not fetch raw file content for {file_path}: {e}")
+        return ""
+
+
+def parse_diff_modified_lines(diff_text):
+    """Extract 1-indexed line numbers in the NEW file that were added/modified (+)."""
+    modified_lines = []
+    current_new_line = 0
+
+    for line in diff_text.splitlines():
+        if line.startswith("@@"):
+            match = re.search(r"\+(\d+)", line)
+            if match:
+                current_new_line = int(match.group(1)) - 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            current_new_line += 1
+            modified_lines.append(current_new_line)
+        elif line.startswith("-") and not line.startswith("---"):
+            pass  # Deleted line does not advance line count in the new file version
+        else:
+            current_new_line += 1
+
+    return modified_lines
+
+
+def extract_scenario_block_ids(file_content, modified_line_nums):
+    """Isolate only the specific Scenario/Scenario Outline blocks touched by code changes."""
+    lines = file_content.splitlines()
+    total_lines = len(lines)
+    tc_ids, xray_ids = set(), set()
+    matched_blocks = []
+    processed_ranges = set()
+
+    for mod_line in modified_line_nums:
+        idx = mod_line - 1
+        if idx < 0 or idx >= total_lines:
+            continue
+
+        # Search upwards for scenario header
+        start_idx = idx
+        while start_idx > 0:
+            if re.match(r"^\s*(Scenario|Scenario Outline):", lines[start_idx], re.IGNORECASE):
+                # Include preceding @tags
+                while start_idx > 0 and lines[start_idx - 1].strip().startswith("@"):
+                    start_idx -= 1
+                break
+            start_idx -= 1
+
+        # Search downwards for end of block or next scenario header
+        end_idx = idx
+        while end_idx < total_lines - 1:
+            next_line = lines[end_idx + 1]
+            if re.match(r"^\s*(Scenario|Scenario Outline):", next_line, re.IGNORECASE) or \
+               (next_line.strip().startswith("@") and any(
+                   re.match(r"^\s*(Scenario|Scenario Outline):", lines[k], re.IGNORECASE)
+                   for k in range(end_idx + 1, min(end_idx + 10, total_lines))
+               )):
+                break
+            end_idx += 1
+
+        block_key = (start_idx, end_idx)
+        if block_key in processed_ranges:
+            continue
+        processed_ranges.add(block_key)
+
+        block_text = "\n".join(lines[start_idx : end_idx + 1])
+
+        # Extract IDs strictly within this scenario block
+        found_tcs = [tc.strip().upper() for tc in re.findall(r"@TestCase:\s*([A-Za-z0-9_-]+)", block_text, re.IGNORECASE)]
+        found_tcs += [tc.replace("_", "-").upper() for tc in re.findall(r"\bTC[_-]\d+\b", block_text, re.IGNORECASE)]
+
+        found_xrays = [xr.strip().upper() for xr in re.findall(r"@Xray(?:ID)?:\s*([A-Za-z0-9_-]+)", block_text, re.IGNORECASE)]
+        found_xrays += [xr.replace("_", "-").upper() for xr in re.findall(r"\b(?:XR|DEV)[_-]\d+\b", block_text, re.IGNORECASE)]
+
+        if found_tcs or found_xrays:
+            unique_tcs = sorted(list(set(found_tcs)))
+            unique_xrays = sorted(list(set(found_xrays)))
+            tc_ids.update(unique_tcs)
+            xray_ids.update(unique_xrays)
+            matched_blocks.append({
+                "start_line": start_idx + 1,
+                "end_line": end_idx + 1,
+                "tc_ids": unique_tcs,
+                "xray_ids": unique_xrays,
+            })
+
+    return sorted(list(tc_ids)), sorted(list(xray_ids)), matched_blocks
+
+
+def extract_ids_from_diff(project_id_encoded, mr_iid, head_sha=None):
+    """
+    Phase 1: Scans newly added/modified lines (+) directly in git patch.
+    Phase 2: Fallback to scenario-bounded parsing of modified test files.
+    """
+    info(f"Scanning MR !{mr_iid} code diffs for Test IDs...")
+    try:
+        mr_changes = gitlab_get(f"/projects/{project_id_encoded}/merge_requests/{mr_iid}/changes")
+    except Exception as e:
+        warn(f"Could not fetch MR changes from GitLab: {e}")
+        return [], [], []
+
+    tc_ids = set()
+    xray_ids = set()
+    matches_detail = []
+
+    # Phase 1: Direct scan on modified (+) lines
+    for change in mr_changes.get("changes", []):
+        file_path = change.get("new_path", "unknown")
+        diff_text = change.get("diff", "")
+        if not diff_text:
+            continue
+
+        for line in diff_text.splitlines():
+            if line.startswith("+") and not line.startswith("+++"):
+                found_tcs = [tc.strip().upper() for tc in re.findall(r"@TestCase:\s*([A-Za-z0-9_-]+)", line, re.IGNORECASE)]
+                if not found_tcs:
+                    found_tcs = [tc.replace("_", "-").upper() for tc in re.findall(r"\bTC[_-]\d+\b", line, re.IGNORECASE)]
+
+                found_xrays = [xr.strip().upper() for xr in re.findall(r"@Xray(?:ID)?:\s*([A-Za-z0-9_-]+)", line, re.IGNORECASE)]
+                if not found_xrays:
+                    found_xrays = [xr.replace("_", "-").upper() for xr in re.findall(r"\b(?:XR|DEV)[_-]\d+\b", line, re.IGNORECASE)]
+
+                if found_tcs or found_xrays:
+                    matches_detail.append({
+                        "file": file_path,
+                        "line": line.strip(),
+                        "tc_ids": found_tcs,
+                        "xray_ids": found_xrays,
+                    })
+                    tc_ids.update(found_tcs)
+                    xray_ids.update(found_xrays)
+
+    # Phase 2: Isolated Scenario Block Fallback
+    if not tc_ids and not xray_ids and head_sha:
+        info("No test IDs found on modified (+) lines. Isolating modified scenario blocks...")
+        for change in mr_changes.get("changes", []):
+            file_path = change.get("new_path", "")
+            diff_text = change.get("diff", "")
+            if not file_path.endswith((".feature", ".java", ".py")) or not diff_text:
+                continue
+
+            mod_lines = parse_diff_modified_lines(diff_text)
+            if not mod_lines:
+                continue
+
+            content = fetch_raw_file_content(project_id_encoded, file_path, head_sha)
+            if not content:
+                continue
+
+            sc_tcs, sc_xrays, block_details = extract_scenario_block_ids(content, mod_lines)
+            for b in block_details:
+                matches_detail.append({
+                    "file": file_path,
+                    "line": f"[SCENARIO BLOCK Lines {b['start_line']}-{b['end_line']}]",
+                    "tc_ids": b["tc_ids"],
+                    "xray_ids": b["xray_ids"],
+                })
+            tc_ids.update(sc_tcs)
+            xray_ids.update(sc_xrays)
+
+    return sorted(list(tc_ids)), sorted(list(xray_ids)), matches_detail
+
+
 def extract_test_case_ids(description):
+    """Fallback extraction from MR description fields."""
     tc_ids = []
     xray_ids = []
 
@@ -158,6 +339,29 @@ def extract_test_case_ids(description):
     return tc_ids, xray_ids
 
 
+def resolve_mr_test_case_ids(project_id_encoded, mr_iid, description, head_sha=None):
+    """
+    Primary: Extract IDs from added code diffs or isolated scenario blocks.
+    Fallback: Extract IDs from MR description text block.
+    """
+    tc_ids, xray_ids, details = extract_ids_from_diff(project_id_encoded, mr_iid, head_sha)
+
+    if tc_ids or xray_ids:
+        info(f"Extracted Test IDs directly from MR code files.")
+        return tc_ids, xray_ids, "diff", details
+
+    info("No test IDs matched in code diffs or scenario blocks. Falling back to MR description...")
+    try:
+        desc_tc_ids, desc_xray_ids = extract_test_case_ids(description)
+        return desc_tc_ids, desc_xray_ids, "description", []
+    except SystemExit:
+        err(
+            f"No Test Case or Xray IDs found in MR !{mr_iid} code diffs, scenarios, or description.\n"
+            "  Ensure test annotations (e.g. TC-1234, XR-5678, DEV-1085503) exist in code "
+            "or are declared in the MR description."
+        )
+
+
 def parse_fix_version(version_str):
     """Convert '26R2.3' -> 'release/26.2.3'"""
     match = re.match(r"(\d+)R(\d+)\.(\d+)", version_str)
@@ -170,7 +374,7 @@ def parse_fix_version(version_str):
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Fetch Jira Metadata
+# Step 2: Fetch Jira Metadata & Dynamic Workflow Transitions
 # ---------------------------------------------------------------------------
 
 def fetch_jira_issue(jira_id):
@@ -182,34 +386,72 @@ def fetch_jira_issue(jira_id):
 
 
 def get_fix_versions(jira_issue):
-    """Return all fix versions from Jira issue."""
-    fix_versions = jira_issue.get("fields", {}).get("fixVersions", [])
-    if not fix_versions:
+    """Safely extract fix versions handling missing/null payload structures."""
+    fields = (jira_issue.get("fields") if isinstance(jira_issue, dict) else {}) or {}
+    fix_versions = fields.get("fixVersions") or []
+
+    names = [v.get("name") for v in fix_versions if isinstance(v, dict) and v.get("name")]
+    if not names:
+        issue_key = jira_issue.get("key", "unknown") if isinstance(jira_issue, dict) else "unknown"
         err(
-            f"No Fix Version set in Jira issue {jira_issue['key']}.\n"
+            f"No Fix Version set in Jira issue {issue_key}.\n"
             "  Set the Fix Version/s field in Jira before running backport."
         )
-    return [v["name"] for v in fix_versions]
+    return names
 
 
 def get_caused_by_jira(jira_issue):
     """Return linked 'is caused by' issue key if present."""
-    links = jira_issue.get("fields", {}).get("issuelinks", [])
+    fields = (jira_issue.get("fields") if isinstance(jira_issue, dict) else {}) or {}
+    links = fields.get("issuelinks") or []
     for link in links:
+        if not isinstance(link, dict):
+            continue
         link_type = link.get("type", {}).get("name", "").lower()
         if "caused by" in link_type or "is caused by" in link_type:
             inward = link.get("inwardIssue") or link.get("outwardIssue")
-            if inward:
+            if inward and isinstance(inward, dict):
                 return inward.get("key")
     return None
+
 
 def get_jira_status(jira_id):
     """Get current workflow status of a Jira issue."""
     issue = jira_get(f"/rest/api/2/issue/{jira_id}?fields=status")
     return issue.get("fields", {}).get("status", {}).get("name", "")
 
+
+def get_jira_transition_id(jira_id, target_status):
+    """Dynamically resolve transition ID by destination state or transition name."""
+    data = jira_get(f"/rest/api/2/issue/{jira_id}/transitions")
+    transitions = data.get("transitions", [])
+
+    for t in transitions:
+        to_name = t.get("to", {}).get("name", "").lower()
+        trans_name = t.get("name", "").lower()
+        target_lower = target_status.lower()
+
+        if target_lower in (to_name, trans_name):
+            return t.get("id")
+
+    err(f"No available Jira transition matching '{target_status}' for issue {jira_id}.")
+
+
+def transition_jira_issue(jira_id, target_status):
+    """Transition Jira issue dynamically by state name."""
+    transition_id = get_jira_transition_id(jira_id, target_status)
+    url = f"{JIRA_URL}/rest/api/2/issue/{jira_id}/transitions"
+    payload = {"transition": {"id": str(transition_id)}}
+
+    resp = requests.post(url, headers=JIRA_HEADERS, json=payload, timeout=30)
+    if resp.status_code == 204:
+        info(f"Jira {jira_id} transitioned to '{target_status}'")
+        return True
+    resp.raise_for_status()
+
+
 # ---------------------------------------------------------------------------
-# Step 3: OpenSearch GM2 Results
+# Step 3: OpenSearch GM2 Results (Dual-Field Match)
 # ---------------------------------------------------------------------------
 
 def fetch_gm2_runs(tc_id, merged_at_iso):
@@ -232,7 +474,8 @@ def fetch_gm2_runs(tc_id, merged_at_iso):
                     {
                         "bool": {
                             "should": [
-                                {"match_phrase": {"x_ray_id": tc_id}}
+                                {"match_phrase": {"x_ray_id": tc_id}},
+                                {"match_phrase": {"test_case_id": tc_id}},
                             ],
                             "minimum_should_match": 1,
                         }
@@ -249,22 +492,16 @@ def fetch_gm2_runs(tc_id, merged_at_iso):
     runs = []
     for hit in hits:
         src = hit.get("_source", {})
-        # rerun_count may be stored as string "0" or integer 0
-        rerun_count = src.get("rerun_count", 0)
         try:
-            rerun_count = int(rerun_count)
+            rerun_count = int(src.get("rerun_count", 0))
         except (ValueError, TypeError):
             rerun_count = 0
 
-        # isCBB may be bool or string
         is_cbb = src.get("isCBB", False)
         if isinstance(is_cbb, str):
             is_cbb = is_cbb.lower() == "true"
 
-        # Strict filter in Python
-        if rerun_count != 0:
-            continue
-        if is_cbb:
+        if rerun_count != 0 or is_cbb:
             continue
 
         runs.append({
@@ -281,16 +518,12 @@ def fetch_gm2_runs(tc_id, merged_at_iso):
     return runs
 
 
-
 # ---------------------------------------------------------------------------
 # Step 4: GM2 Eligibility
 # ---------------------------------------------------------------------------
 
 def evaluate_eligibility(tc_id, runs):
-    """
-    Returns (eligible: bool, reason: str, pattern_str: str)
-    Eligible only when the latest two executions are both Passed.
-    """
+    """Eligible only when the latest two executions are both Passed."""
     if len(runs) < 2:
         pattern = " -> ".join(r["test_result"] for r in runs) or "(no runs)"
         return False, "Insufficient GM2 runs (need at least 2 post-merge)", pattern
@@ -306,7 +539,7 @@ def evaluate_eligibility(tc_id, runs):
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Cherry-pick Dry Run
+# Step 5: Cherry-pick Dry Run & Branch Operations
 # ---------------------------------------------------------------------------
 
 def fetch_mr_commits(project_id_encoded, mr_iid):
@@ -314,7 +547,6 @@ def fetch_mr_commits(project_id_encoded, mr_iid):
 
 
 def check_existing_backport_mr(project_id_encoded, backport_branch, target_branch):
-    """Check if a backport MR already exists for this branch."""
     mrs = gitlab_get(
         f"/projects/{project_id_encoded}/merge_requests",
         params={"state": "opened", "target_branch": target_branch, "per_page": 100},
@@ -324,10 +556,6 @@ def check_existing_backport_mr(project_id_encoded, backport_branch, target_branc
             return mr
     return None
 
-
-# ---------------------------------------------------------------------------
-# Step 6: Backport MR Creation
-# ---------------------------------------------------------------------------
 
 def create_backport_branch(project_id_encoded, backport_branch, target_branch):
     info(f"Creating branch '{backport_branch}' from '{target_branch}' ...")
@@ -386,7 +614,7 @@ def build_dashboard_url(tc_id):
         "params:(query:GM2),type:phrase),query:(match_phrase:(environment:GM2)))),"
         f"query:(language:kuery,query:{kql_query}))"
     )
-    return base  # starts with /app/ — correct format for shorten API
+    return base
 
 
 def shorten_dashboard_url(path):
@@ -402,50 +630,35 @@ def shorten_dashboard_url(path):
             timeout=10,
             verify=False,
         )
-        info(f"  Shorten API status: {resp.status_code}")
-        info(f"  Shorten API response: {resp.text}")
         resp.raise_for_status()
         url_id = resp.json().get("urlId")
         if url_id:
             return f"https://autoinfra-es.vaultdev.com/_dashboards/goto/{url_id}"
-        warn(f"Shorten URL returned no urlId: {resp.text}")
     except Exception as e:
         warn(f"URL shortening failed ({type(e).__name__}): {e}")
-    # Fallback: full long URL with domain
     return f"https://autoinfra-es.vaultdev.com/_dashboards{path}"
-
-def transition_jira_issue(jira_id, transition_id, transition_name):
-    """Transition a Jira issue to a new workflow state."""
-    url = f"{JIRA_URL}/rest/api/2/issue/{jira_id}/transitions"
-    payload = {"transition": {"id": str(transition_id)}}
-    resp = requests.post(url, headers=JIRA_HEADERS, json=payload, timeout=30)
-    if resp.status_code == 204:
-        info(f"Jira {jira_id} transitioned to '{transition_name}'")
-        return True
-    resp.raise_for_status()
 
 
 # ---------------------------------------------------------------------------
-# Step 7: Jira Comment
+# Step 7: Jira Comment Payload Builder
 # ---------------------------------------------------------------------------
 
 def build_jira_comment(
-    original_mr_url,
-    backport_mr_url,
-    dev_checkin_jira,
-    gm2_run_count,
-    test_case_count,
-    fix_version,
-    tc_ids,
+        original_mr_url,
+        backport_mr_url,
+        dev_checkin_jira,
+        gm2_run_count,
+        test_case_count,
+        fix_version,
+        tc_ids,
 ):
     risk = "Low" if test_case_count <= 2 else ("Medium" if test_case_count <= 5 else "High")
     dev_checkin_answer = f"Yes - {dev_checkin_jira}" if dev_checkin_jira else "No"
 
-    # Build per-TC GM2 run links
     gm2_links = []
     for tc_id in tc_ids:
-        path = build_dashboard_url(tc_id)  # path only e.g. /_dashboards/app/...
-        short_url = shorten_dashboard_url(path)  # returns short URL or full fallback
+        path = build_dashboard_url(tc_id)
+        short_url = shorten_dashboard_url(path)
         gm2_links.append(f"{tc_id}: {short_url}")
     gm2_runs_section = "\n".join(gm2_links)
 
@@ -482,16 +695,21 @@ GM2 Runs:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main Execution Pipeline
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="GitLab/Jira/GM2 Backport Automation")
     parser.add_argument("--mr", required=True, type=int, help="Develop MR IID")
     parser.add_argument(
+        "--inspect-ids",
+        action="store_true",
+        help="Inspect and display modified Test Case/Xray IDs from MR diffs and exit.",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
-        help="Phase 2: actually create backport MR and post Jira comment",
+        help="Phase 2: create backport MR, post comment, and transition Jira issue",
     )
     parser.add_argument(
         "--target-branch",
@@ -499,60 +717,97 @@ def main():
         default=None,
         help="Override target release branch (e.g. release/26.2.2).",
     )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Fail fast on warnings instead of prompting for stdin input",
+    )
     args = parser.parse_args()
 
-    # Validate env vars
     missing = [v for v in ["GITLAB_TOKEN", "JIRA_PAT"] if not os.environ.get(v)]
     if missing:
         err(f"Missing required environment variables: {', '.join(missing)}")
 
-    print("\n" + "=" * 60)
-    print("  BACKPORT ELIGIBILITY REPORT")
-    print("=" * 60)
-
-    # -----------------------------------------------------------------------
-    # Step 1: MR Metadata
-    # -----------------------------------------------------------------------
     project_path = "veevavault/vaultautomationtests"
     project_id_encoded = project_path.replace("/", "%2F")
 
+    # Step 1: MR Metadata & ID Resolution
     mr = fetch_mr(project_id_encoded, args.mr)
     mr_title = mr.get("title", "")
     mr_description = mr.get("description", "") or ""
     mr_author = mr.get("author", {}).get("username", "unknown")
     mr_web_url = mr.get("web_url", "")
     merged_at = mr.get("merged_at")
+    head_sha = mr.get("sha") or mr.get("diff_refs", {}).get("head_sha")
 
-    if not merged_at:
-        err(f"MR !{args.mr} has not been merged yet.")
-
-    merged_at_iso = merged_at if merged_at.endswith("Z") else merged_at + "Z"
     jira_id = extract_jira_id(mr_title)
-    tc_ids, xray_ids = extract_test_case_ids(mr_description)
+    tc_ids, xray_ids, id_source, diff_details = resolve_mr_test_case_ids(
+        project_id_encoded, args.mr, mr_description, head_sha=head_sha
+    )
     all_tc_ids = tc_ids + xray_ids
 
+    # Handle --inspect-ids inspection mode
+    if args.inspect_ids:
+        print("\n" + "=" * 60)
+        print(f"  TEST CASE INSPECTION REPORT FOR MR !{args.mr}")
+        print("=" * 60)
+        print(f"MR Title: {mr_title}")
+        print(f"Jira ID:  {jira_id}")
+        print(f"Source:   {id_source.upper()}")
+
+        if diff_details:
+            print("\nMatched Scenario Blocks / Lines:")
+            print("-" * 60)
+            for item in diff_details:
+                print(f"File: {item['file']}")
+                print(f"  Line:   {item['line']}")
+                if item['tc_ids']:
+                    print(f"  TCs:    {', '.join(item['tc_ids'])}")
+                if item['xray_ids']:
+                    print(f"  Xrays:  {', '.join(item['xray_ids'])}")
+                print("-" * 60)
+
+        print("\nExtracted Identifiers:")
+        print(f"  Test Case IDs ({len(tc_ids)}): {', '.join(tc_ids) or 'None'}")
+        print(f"  Xray IDs      ({len(xray_ids)}): {', '.join(xray_ids) or 'None'}")
+        print("=" * 60 + "\n")
+        sys.exit(0)
+
+    # Continue Backport Workflow
+    if not merged_at:
+        err(f"MR !{args.mr} has not been merged yet.")
+    merged_at_iso = merged_at if merged_at.endswith("Z") else merged_at + "Z"
+
+    print("\n" + "=" * 60)
+    print("  BACKPORT ELIGIBILITY REPORT")
+    print("=" * 60)
     print(f"\nMR:            !{args.mr}")
     print(f"Title:         {mr_title}")
     print(f"Author:        {mr_author}")
     print(f"Merged At:     {merged_at_iso}")
     print(f"Jira:          {jira_id}")
+    print(f"ID Source:     {id_source.upper()}")
     print(f"Test Cases:    {', '.join(tc_ids) or 'none'}")
     print(f"Xray IDs:      {', '.join(xray_ids) or 'none'}")
 
-    # -----------------------------------------------------------------------
     # Step 2: Jira Metadata
-    # -----------------------------------------------------------------------
     jira_issue = fetch_jira_issue(jira_id)
     fix_versions = get_fix_versions(jira_issue)
     caused_by_jira = get_caused_by_jira(jira_issue)
 
     info(f"Fix Versions found: {', '.join(fix_versions)}")
 
-    # Build list of (fix_version_raw, version_str, target_branch) to process
+    jira_branches = []
+    for fv in fix_versions:
+        try:
+            _, b = parse_fix_version(fv)
+            jira_branches.append(b)
+        except SystemExit:
+            pass
+
     if args.target_branch:
         target_branch = args.target_branch
         version_str = target_branch.replace("release/", "")
-        # Find matching fix version label from Jira for use in comment
         matched_fix_version = None
         for fv in fix_versions:
             try:
@@ -563,19 +818,15 @@ def main():
             except SystemExit:
                 pass
         fix_version_raw = matched_fix_version or version_str
-        # Warn if override doesn't match any Jira fix version
-        jira_branches = []
-        for fv in fix_versions:
-            try:
-                _, b = parse_fix_version(fv)
-                jira_branches.append(b)
-            except SystemExit:
-                pass
+
         if target_branch not in jira_branches:
             warn(
                 f"Target branch override '{target_branch}' does not match "
                 f"any Jira Fix Version branch: {', '.join(jira_branches)}"
             )
+            if args.non_interactive or not sys.stdin.isatty():
+                err("Aborting run in non-interactive environment due to target branch mismatch.")
+
             confirm = input("Do you want to continue anyway? (yes/no): ").strip().lower()
             if confirm != "yes":
                 print("Aborted.")
@@ -588,9 +839,7 @@ def main():
             vs, tb = parse_fix_version(fv)
             versions_to_process.append((fv, vs, tb))
 
-    # -----------------------------------------------------------------------
-    # Step 3 & 4: GM2 Runs + Eligibility (shared across all versions)
-    # -----------------------------------------------------------------------
+    # Step 3 & 4: GM2 Runs + Eligibility
     print("\nTest Case GM2 Results:")
     print("-" * 40)
 
@@ -611,9 +860,7 @@ def main():
     verdict = "BACKPORT" if overall_eligible else "DO NOT BACKPORT"
     print(f"\nOverall: {verdict}")
 
-    # -----------------------------------------------------------------------
-    # Step 5: Cherry-pick Dry Run (shared across all versions)
-    # -----------------------------------------------------------------------
+    # Step 5: Cherry-pick Dry Run
     commits = fetch_mr_commits(project_id_encoded, args.mr)
     commits_ordered = list(reversed(commits))
 
@@ -621,7 +868,6 @@ def main():
     for c in commits_ordered:
         print(f"  {c['id'][:8]} - {c['title']}")
 
-    # Show dry run info per version
     print(f"\nVersions to process: {len(versions_to_process)}")
     for fix_version_raw, version_str, target_branch in versions_to_process:
         backport_branch = f"r{version_str}_gm/{mr_author}/{jira_id}_SU"
@@ -634,14 +880,12 @@ def main():
 
     if not args.execute:
         print(
-            "\nDry run complete. Run with --execute to create the backport MR and post Jira comment."
+            "\nDry run complete. Run with --execute to create backport MR and post Jira comment."
         )
         print("=" * 60 + "\n")
         return
 
-    # -----------------------------------------------------------------------
-    # Phase 2: Execute — loop over each fix version
-    # -----------------------------------------------------------------------
+    # Phase 2 Execution Loop
     if not overall_eligible:
         err("GM2 eligibility check failed. Verdict: DO NOT BACKPORT. Aborting execution.")
 
@@ -658,10 +902,8 @@ def main():
             backport_mr_url = existing_mr["web_url"]
             warn(f"Skipping MR creation — backport MR already exists: {backport_mr_url}")
         else:
-            # Create branch
             create_backport_branch(project_id_encoded, backport_branch, target_branch)
 
-            # Cherry-pick commits with conflict handling
             conflict_occurred = False
             for c in commits_ordered:
                 try:
@@ -685,7 +927,6 @@ def main():
                 print(f"  Skipping {fix_version_raw} due to conflict. Moving to next version.")
                 continue
 
-            # Create MR
             backport_title = f"Backport: {mr_title}"
             backport_description = (
                 f"Automated backport of !{args.mr} to `{target_branch}`.\n\n"
@@ -702,7 +943,7 @@ def main():
             backport_mr_url = backport_mr["web_url"]
             info(f"Backport MR created: {backport_mr_url}")
 
-        # Post Jira comment
+        # Post Jira Comment
         info(f"Posting Jira comment to {jira_id} ...")
         comment_body = build_jira_comment(
             original_mr_url=mr_web_url,
@@ -716,18 +957,18 @@ def main():
         jira_post_comment(jira_id, comment_body)
         info("Jira comment posted successfully.")
 
-        # Jira workflow transition
+        # Dynamic Jira Workflow Transition
         current_status = get_jira_status(jira_id)
         info(f"Current Jira status: {current_status}")
 
         if current_status == "Running on GM2":
             info(f"Transitioning {jira_id}: Running on GM2 → GM Data Creation ...")
-            transition_jira_issue(jira_id, JIRA_TRANSITION_PASSED_GM2, "GM Data Creation")
+            transition_jira_issue(jira_id, "GM Data Creation")
             info(f"Transitioning {jira_id}: GM Data Creation → MR to GM ...")
-            transition_jira_issue(jira_id, JIRA_TRANSITION_DATA_CREATED, "MR to GM")
+            transition_jira_issue(jira_id, "MR to GM")
         elif current_status == "GM Data Creation":
             info(f"Transitioning {jira_id}: GM Data Creation → MR to GM ...")
-            transition_jira_issue(jira_id, JIRA_TRANSITION_DATA_CREATED, "MR to GM")
+            transition_jira_issue(jira_id, "MR to GM")
         elif current_status == "MR to GM":
             warn(f"Jira {jira_id} already in 'MR to GM' — skipping transitions.")
         else:
