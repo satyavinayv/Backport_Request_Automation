@@ -1,0 +1,45 @@
+# Secrets & environment files
+.env
+set_env.ps1
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs (when we add audit trail later)
+logs/
+*.log
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
