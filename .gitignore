@@ -43,3 +43,7 @@ logs/
 .pytest_cache/
 htmlcov/
 .coverage
+
+#Claude Settings
+.claude
+claude_metrics_log.xlsx
