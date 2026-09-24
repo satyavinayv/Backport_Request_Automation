@@ -100,3 +100,41 @@ def resolve_mr_test_case_ids(project_id_encoded, mr_iid, description, head_sha=N
         return desc_tc_ids, desc_xray_ids, "description", []
 
     return [], [], "none", []
+
+
+def get_deleted_feature_ids(changes):
+    """
+    Extract TC/Xray IDs from .feature files that were DELETED (not modified) in this MR.
+    Used to skip GM2 checks for tests that no longer exist, while still recording them.
+    Returns (deleted_tc_ids, deleted_xray_ids) — deduplicated sorted lists.
+    """
+    _TC_RE = re.compile(r"\bTC-\d+\b")
+    _XRAY_RE = re.compile(r"\bDEV-\d+\b")
+    tc_ids: set = set()
+    xray_ids: set = set()
+    for change in changes:
+        if not change.get("deleted_file"):
+            continue
+        old_path = change.get("old_path", "")
+        if not old_path.endswith(".feature"):
+            continue
+        for line in change.get("diff", "").splitlines():
+            if line.startswith("-") and not line.startswith("---"):
+                tc_ids.update(m.group(0) for m in _TC_RE.finditer(line))
+                xray_ids.update(m.group(0) for m in _XRAY_RE.finditer(line))
+    return sorted(tc_ids), sorted(xray_ids)
+
+
+def get_non_feature_changed_files(changes):
+    """
+    Return new_path of all changed, non-deleted, non-.feature files.
+    These are candidates for Phase 4 repo-file search.
+    """
+    result = []
+    for change in changes:
+        if change.get("deleted_file"):
+            continue
+        path = change.get("new_path") or change.get("old_path", "")
+        if path and not path.endswith(".feature"):
+            result.append(path)
+    return result

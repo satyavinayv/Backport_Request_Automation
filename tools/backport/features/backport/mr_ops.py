@@ -3,14 +3,20 @@ from utils.log import info
 
 
 def check_existing_backport_mr(project_id_encoded, backport_branch, target_branch):
-    mrs = gitlab_get(
-        f"/projects/{project_id_encoded}/merge_requests",
-        params={"state": "opened", "target_branch": target_branch, "per_page": 100},
-    )
-    for mr in mrs:
-        if mr.get("source_branch") == backport_branch:
-            return mr
-    return None
+    """
+    Check for an existing backport MR on this branch across all states.
+    Returns (mr_object, state) where state is 'opened', 'merged', or 'closed'.
+    Returns (None, None) if not found.
+    """
+    for state in ("opened", "merged", "closed"):
+        mrs = gitlab_get(
+            f"/projects/{project_id_encoded}/merge_requests",
+            params={"state": state, "target_branch": target_branch, "per_page": 100},
+        )
+        for mr in mrs:
+            if mr.get("source_branch") == backport_branch:
+                return mr, state
+    return None, None
 
 
 def create_mr(
@@ -40,7 +46,7 @@ def create_mr(
     return gitlab_post(f"/projects/{project_id_encoded}/merge_requests", payload)
 
 
-_EXCLUDED_LABELS = {"SCBA Approved 🤿", "GM2 Fixes"}
+_EXCLUDED_LABELS = {"SCBA Approved 🤿", "GM2 Fixes", "PeerReviewed"}
 
 
 def build_label_set(original_mr_labels, env_labels_str, cli_labels_str):

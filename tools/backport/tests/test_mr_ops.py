@@ -59,6 +59,11 @@ class TestBuildLabelSet:
         assert "SCBA Approved 🤿" not in result
         assert "team-qa" in result
 
+    def test_peer_reviewed_excluded(self):
+        result = build_label_set(["PeerReviewed", "team-qa"], "", "")
+        assert "PeerReviewed" not in result
+        assert "team-qa" in result
+
     def test_gm2_fixes_excluded(self):
         result = build_label_set(["GM2 Fixes", "backport"], "", "")
         assert "GM2 Fixes" not in result
@@ -75,19 +80,36 @@ class TestCheckExistingBackportMr:
     def test_found(self):
         fake_mr = {"source_branch": "r26.2.3_gm/user/QA-1_SU", "web_url": "https://gitlab/mr/1"}
         with patch("features.backport.mr_ops.gitlab_get", return_value=[fake_mr]):
-            result = check_existing_backport_mr("proj", "r26.2.3_gm/user/QA-1_SU", "release/26.2.3")
-        assert result == fake_mr
+            mr, state = check_existing_backport_mr("proj", "r26.2.3_gm/user/QA-1_SU", "release/26.2.3")
+        assert mr == fake_mr
+        assert state == "opened"
 
     def test_not_found_returns_none(self):
         fake_mr = {"source_branch": "some-other-branch", "web_url": "https://gitlab/mr/2"}
         with patch("features.backport.mr_ops.gitlab_get", return_value=[fake_mr]):
-            result = check_existing_backport_mr("proj", "r26.2.3_gm/user/QA-1_SU", "release/26.2.3")
-        assert result is None
+            mr, state = check_existing_backport_mr("proj", "r26.2.3_gm/user/QA-1_SU", "release/26.2.3")
+        assert mr is None
+        assert state is None
 
     def test_empty_mr_list_returns_none(self):
         with patch("features.backport.mr_ops.gitlab_get", return_value=[]):
-            result = check_existing_backport_mr("proj", "branch", "target")
-        assert result is None
+            mr, state = check_existing_backport_mr("proj", "branch", "target")
+        assert mr is None
+        assert state is None
+
+    def test_closed_mr_found(self):
+        fake_mr = {"source_branch": "r26.2.3_gm/user/QA-1_SU", "web_url": "https://gitlab/mr/1"}
+
+        def fake_get(path, params=None):
+            # Return empty for 'opened', the MR for 'closed'
+            if params and params.get("state") == "closed":
+                return [fake_mr]
+            return []
+
+        with patch("features.backport.mr_ops.gitlab_get", side_effect=fake_get):
+            mr, state = check_existing_backport_mr("proj", "r26.2.3_gm/user/QA-1_SU", "release/26.2.3")
+        assert mr == fake_mr
+        assert state == "closed"
 
 
 class TestCreateMr:

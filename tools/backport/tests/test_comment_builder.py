@@ -177,7 +177,7 @@ class TestPerTcBypass:
             per_tc_bypasses={"TC-5678": "Environment issue"},
         )
         assert "4 times" in comment
-        assert "1 test(s) selectively bypassed" in comment
+        assert "1 test(s) with special eligibility" in comment
 
     def test_all_tcs_bypassed_shows_all_bypass_labels(self):
         comment = _build(

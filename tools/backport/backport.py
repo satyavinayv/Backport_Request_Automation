@@ -42,10 +42,15 @@ from config import PROJECT_ID_ENCODED, JIRA_URL, BACKPORT_REVIEWERS, BACKPORT_LA
 from utils.log import err, warn, info
 from clients.gitlab import fetch_mr, fetch_mr_commits, get_current_user, resolve_usernames_to_ids
 from clients.jira import jira_post_comment
-from features.id_extraction import extract_jira_id, extract_all_jira_ids, resolve_mr_test_case_ids
+from features.id_extraction import (
+    extract_jira_id, extract_all_jira_ids, resolve_mr_test_case_ids,
+    get_deleted_feature_ids, get_non_feature_changed_files,
+)
 from features.id_extraction.jira_test_linker import extract_ids_via_jira_scenarios
-from features.gm2_eligibility.runner import fetch_gm2_runs
-from features.gm2_eligibility.evaluator import evaluate_eligibility
+from features.id_extraction.repo_file_searcher import search_repo_for_file_usages
+from features.gm2_eligibility.runner import fetch_gm2_runs, classify_gm2_absence, fetch_gm2_runs_cbb
+from features.gm2_eligibility.evaluator import evaluate_eligibility, evaluate_eligibility_cbb
+from clients.gitlab import fetch_mr_file_changes
 from features.backport.branch_ops import create_backport_branch, cherry_pick_commit, delete_branch
 from features.backport.mr_ops import check_existing_backport_mr, create_mr, build_label_set
 from features.jira_workflow.issue import fetch_jira_issue, fetch_jira_issue_safe, get_fix_versions, get_caused_by_jira, parse_fix_version
@@ -54,13 +59,33 @@ from features.jira_workflow.comment_builder import build_jira_comment
 
 
 def _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id, jira_issue):
-    """Extract TC/Xray IDs for a single MR through all fallback phases."""
+    """
+    Extract TC/Xray IDs for a single MR through all fallback phases (1-4).
+    Also detects and returns TC IDs from deleted .feature files.
+
+    Returns:
+        tc_ids, xray_ids, id_source, diff_details, all_tc_ids,
+        deleted_tc_ids, deleted_xray_ids, phase4_files_searched, skip_gm2_no_ids
+    """
+    # Fetch raw file changes once — used for both deleted-file detection and Phase 4
+    changes = fetch_mr_file_changes(PROJECT_ID_ENCODED, mr_iid)
+    deleted_tc_ids, deleted_xray_ids = get_deleted_feature_ids(changes)
+
+    if deleted_tc_ids or deleted_xray_ids:
+        info(
+            f"  Detected deleted .feature file(s) in !{mr_iid}: "
+            f"TC IDs {deleted_tc_ids or []}, Xray IDs {deleted_xray_ids or []} — GM2 check will be skipped for these."
+        )
+
     tc_ids, xray_ids, id_source, diff_details = resolve_mr_test_case_ids(
         PROJECT_ID_ENCODED, mr_iid, mr_description, head_sha=head_sha
     )
     all_tc_ids = tc_ids + xray_ids
+    phase4_files_searched = []
+    skip_gm2_no_ids = False
 
     if not all_tc_ids:
+        # Phase 3: Jira description scenario lookup
         all_jira_ids = extract_all_jira_ids(mr_title, mr_description)
         info(
             f"Phase 3: No IDs found via diffs or MR description for !{mr_iid}. "
@@ -99,7 +124,43 @@ def _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id
                 "    Xray IDs: DEV-XXXXX, DEV-YYYYY"
             )
 
-    return tc_ids, xray_ids, id_source, diff_details, all_tc_ids
+    if not all_tc_ids:
+        # Phase 4: search repo for .feature files referencing the changed filenames
+        non_feature_files = get_non_feature_changed_files(changes)
+        if non_feature_files:
+            info(f"Phase 4: Searching repo for feature file references to {len(non_feature_files)} changed file(s) ...")
+            combined_tcs = set()
+            combined_xrays = set()
+            combined_details = []
+            for fpath in non_feature_files:
+                p4_tcs, p4_xrays, p4_details, p4_hits = search_repo_for_file_usages(
+                    PROJECT_ID_ENCODED, fpath, ref="develop"
+                )
+                if p4_tcs or p4_xrays:
+                    phase4_files_searched.append(
+                        {"file": fpath, "hits": p4_hits, "tc_ids": p4_tcs, "xray_ids": p4_xrays}
+                    )
+                    combined_tcs.update(p4_tcs)
+                    combined_xrays.update(p4_xrays)
+                    combined_details.extend(p4_details)
+
+            if combined_tcs or combined_xrays:
+                tc_ids = sorted(combined_tcs)
+                xray_ids = sorted(combined_xrays)
+                diff_details = combined_details
+                id_source = "repo-file-search"
+                all_tc_ids = tc_ids + xray_ids
+                warn(
+                    "Phase 4 IDs sourced from feature files referencing the changed file(s).\n"
+                    "  Coverage may be partial if the file is referenced outside the inferred scope.\n"
+                    "  To ensure complete coverage, add all known IDs to the MR description:\n"
+                    "    Xray IDs: DEV-XXXXX, DEV-YYYYY"
+                )
+
+    return (
+        tc_ids, xray_ids, id_source, diff_details, all_tc_ids,
+        deleted_tc_ids, deleted_xray_ids, phase4_files_searched, skip_gm2_no_ids,
+    )
 
 
 def main():
@@ -197,16 +258,32 @@ def main():
         caused_by_jira = get_caused_by_jira(jira_issue)
         info(f"!{mr_iid} ({jira_id}) Fix Versions: {', '.join(fix_versions)}")
 
-        tc_ids, xray_ids, id_source, diff_details, all_tc_ids = _resolve_test_ids_for_mr(
-            mr_iid, mr_title, mr_description, head_sha, jira_id, jira_issue
-        )
+        (
+            tc_ids, xray_ids, id_source, diff_details, all_tc_ids,
+            mr_deleted_tc_ids, mr_deleted_xray_ids, phase4_files, skip_gm2_no_ids,
+        ) = _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id, jira_issue)
 
-        if not all_tc_ids:
-            err(
-                f"No Test Case or Xray IDs found via any method for MR !{mr_iid}.\n"
-                "  Checked: code diffs, scenario blocks, MR description, Jira description table(s).\n"
-                "  Add test annotations (TC-XXXX, DEV-XXXXX) to the code or MR description."
-            )
+        if not all_tc_ids and not skip_gm2_no_ids:
+            if not args.non_interactive and sys.stdin.isatty():
+                warn(
+                    f"No Test Case or Xray IDs found via any method for MR !{mr_iid}.\n"
+                    "  Checked: code diffs, scenario blocks, MR description, Jira description, repo file search."
+                )
+                confirm = input("  Continue without GM2 check for this MR? (y/n): ").strip().lower()
+                if confirm == "y":
+                    skip_gm2_no_ids = True
+                    warn("Proceeding without GM2 check — no test IDs found.")
+                else:
+                    err(
+                        f"Aborted: No test IDs found for MR !{mr_iid}.\n"
+                        "  Add test annotations (TC-XXXX, DEV-XXXXX) to the code or MR description."
+                    )
+            else:
+                err(
+                    f"No Test Case or Xray IDs found via any method for MR !{mr_iid}.\n"
+                    "  Checked: code diffs, scenario blocks, MR description, Jira description, repo file search.\n"
+                    "  Add test annotations (TC-XXXX, DEV-XXXXX) to the code or MR description."
+                )
 
         mr_records.append({
             "iid": mr_iid,
@@ -226,6 +303,9 @@ def main():
             "xray_ids": xray_ids,
             "id_source": id_source,
             "diff_details": diff_details,
+            "deleted_tc_ids": mr_deleted_tc_ids,
+            "deleted_xray_ids": mr_deleted_xray_ids,
+            "skip_gm2_no_ids": skip_gm2_no_ids,
         })
 
     # -------------------------------------------------------------------------
@@ -268,6 +348,18 @@ def main():
 
     # caused_by_jira: first non-None value
     caused_by_jira = next((rec["caused_by_jira"] for rec in mr_records if rec["caused_by_jira"]), None)
+
+    # Aggregate deleted TC IDs across all MRs (deduplicated)
+    seen_deleted: set = set()
+    combined_deleted_tc_ids = []
+    for rec in mr_records:
+        for dtc in rec.get("deleted_tc_ids", []) + rec.get("deleted_xray_ids", []):
+            if dtc not in seen_deleted:
+                combined_deleted_tc_ids.append(dtc)
+                seen_deleted.add(dtc)
+
+    # skip_gm2_no_ids: true if ANY MR has no IDs and user agreed to skip
+    skip_gm2_no_ids = any(rec.get("skip_gm2_no_ids") for rec in mr_records)
 
     # -------------------------------------------------------------------------
     # --inspect-ids mode
@@ -323,6 +415,9 @@ def main():
         print(f"Xray IDs:      {', '.join(rec['xray_ids']) or 'none'}")
     if multi:
         print(f"\nCombined Test IDs ({len(all_tc_ids)}): {', '.join(all_tc_ids)}")
+
+    if combined_deleted_tc_ids:
+        print(f"\nDeleted Tests (GM2 skipped): {', '.join(combined_deleted_tc_ids)}")
 
     # -------------------------------------------------------------------------
     # Step 4: Fix Version → target branches
@@ -381,6 +476,9 @@ def main():
         for _tid in args.bypass_gm2_for:
             per_tc_bypasses[_tid] = args.bypass_gm2_for_reason
 
+    # cbb_eligible_tcs: tc_id -> cbb_branch used for CBB-based eligibility
+    cbb_eligible_tcs: dict = {}
+
     if args.bypass_gm2:
         print("\n" + "!" * 60)
         print("  !! GM2 ELIGIBILITY CHECK BYPASSED !!")
@@ -388,9 +486,19 @@ def main():
         print("  Proceeding with backport without GM2 eligibility check.")
         print("!" * 60)
         verdict = "BYPASSED"
+    elif skip_gm2_no_ids:
+        print("\n" + "!" * 60)
+        print("  !! GM2 CHECK SKIPPED — NO FEATURE FILE REFERENCES FOUND !!")
+        print("  No TC/Xray IDs could be resolved via any extraction phase.")
+        print("!" * 60)
+        verdict = "BACKPORT ELIGIBLE (GM2 skipped — no IDs found)"
     else:
         print("\nTest Case GM2 Results:")
         print("-" * 40)
+
+        if combined_deleted_tc_ids:
+            for dtc in combined_deleted_tc_ids:
+                print(f"  {dtc}: [SKIPPED — test deleted in this MR]")
 
         for tc_id in all_tc_ids:
             if tc_id in per_tc_bypasses:
@@ -400,29 +508,75 @@ def main():
             runs = fetch_gm2_runs(tc_id, merged_at_iso)
             eligible, reason, pattern_str = evaluate_eligibility(tc_id, runs)
             total_run_count += len(runs)
-            status = "[ELIGIBLE]" if eligible else "[NOT ELIGIBLE]"
-            print(f"  {tc_id}: {pattern_str} -> {status}")
 
-            if not eligible:
+            if not eligible and not runs:
+                # Distinguish new test (no history) from CBB/rerun-only
+                absence = classify_gm2_absence(tc_id, merged_at_iso)
+
+                if absence == "NO_HISTORY":
+                    print(f"  {tc_id}: [NEW TEST — NO GM2 HISTORY] -> [NOT ELIGIBLE]")
+                    print(f"    This test has no GM2 executions post-merge. Backport not recommended.")
+                    print(f"    If urgent, use: --bypass-gm2-for {tc_id} --bypass-gm2-for-reason '<reason>'")
+                    if not args.non_interactive and sys.stdin.isatty():
+                        confirm = input(
+                            f"    Force bypass for new test {tc_id}? (y/n): "
+                        ).strip().lower()
+                        if confirm == "y":
+                            br = input(f"    Enter bypass reason: ").strip() or "New test, urgent backport"
+                            per_tc_bypasses[tc_id] = br
+                            print(f"    [BYPASSED] {tc_id}: {br}")
+                        else:
+                            overall_eligible = False
+                    else:
+                        overall_eligible = False
+
+                else:  # CBB_RERUN_ONLY
+                    print(f"  {tc_id}: [NO NORMAL RUNS — ONLY CBB/RERUN FOUND]")
+                    if not args.non_interactive and sys.stdin.isatty():
+                        cbb_branch = input(
+                            f"    Enter build_branches value to search CBB runs for {tc_id}"
+                            f" (e.g. r26.2.3/user/QA-XXXXX), or press Enter to skip: "
+                        ).strip()
+                        if cbb_branch:
+                            cbb_runs = fetch_gm2_runs_cbb(tc_id, merged_at_iso, cbb_branch)
+                            cbb_ok, cbb_reason, cbb_pattern = evaluate_eligibility_cbb(tc_id, cbb_runs)
+                            if cbb_ok:
+                                print(f"    {tc_id} (CBB): {cbb_pattern} -> [ELIGIBLE via CBB]")
+                                cbb_eligible_tcs[tc_id] = cbb_branch
+                            else:
+                                print(f"    {tc_id} (CBB): {cbb_pattern} -> [NOT ELIGIBLE]")
+                                print(f"    Reason: {cbb_reason}")
+                                overall_eligible = False
+                        else:
+                            print(f"    CBB check skipped for {tc_id}. Marked NOT ELIGIBLE.")
+                            overall_eligible = False
+                    else:
+                        overall_eligible = False
+
+            elif not eligible:
+                print(f"  {tc_id}: {pattern_str} -> [NOT ELIGIBLE]")
                 print(f"    Reason: {reason}")
                 if not args.non_interactive and sys.stdin.isatty():
                     confirm = input(
                         f"    Bypass GM2 check for {tc_id}? (y/n): "
                     ).strip().lower()
                     if confirm == "y":
-                        bypass_reason = input(
+                        br = input(
                             f"    Enter bypass reason for {tc_id}: "
                         ).strip() or "User-confirmed bypass — known failure reason"
-                        per_tc_bypasses[tc_id] = bypass_reason
-                        print(f"    [BYPASSED] {tc_id}: {bypass_reason}")
+                        per_tc_bypasses[tc_id] = br
+                        print(f"    [BYPASSED] {tc_id}: {br}")
                     else:
                         overall_eligible = False
                 else:
                     overall_eligible = False
+            else:
+                print(f"  {tc_id}: {pattern_str} -> [ELIGIBLE]")
 
         print("-" * 40)
-        if overall_eligible and per_tc_bypasses:
-            verdict = "BACKPORT ELIGIBLE (selective GM2 bypass)"
+        has_special = bool(per_tc_bypasses or cbb_eligible_tcs)
+        if overall_eligible and has_special:
+            verdict = "BACKPORT ELIGIBLE (with selective GM2 overrides)"
         elif overall_eligible:
             verdict = "BACKPORT ELIGIBLE"
         else:
@@ -452,12 +606,17 @@ def main():
     print(f"\nVersions to process: {len(versions_to_process)}")
     for fix_version_raw, version_str, target_branch in versions_to_process:
         backport_branch = f"r{version_str}_gm/{mr_author}/{jira_id_str}_SU"
-        existing_mr = check_existing_backport_mr(PROJECT_ID_ENCODED, backport_branch, target_branch)
+        existing_mr, existing_mr_state = check_existing_backport_mr(PROJECT_ID_ENCODED, backport_branch, target_branch)
         print(f"\n  Fix Version:     {fix_version_raw}")
         print(f"  Target Branch:   {target_branch}")
         print(f"  Backport Branch: {backport_branch}")
         if existing_mr:
-            warn(f"  Backport MR already exists: {existing_mr['web_url']}")
+            if existing_mr_state == "opened":
+                warn(f"  Backport MR already open: {existing_mr['web_url']}")
+            elif existing_mr_state == "merged":
+                warn(f"  Backport MR already merged: {existing_mr['web_url']}")
+            elif existing_mr_state == "closed":
+                warn(f"  Previously closed backport MR found: {existing_mr['web_url']} — will re-create on --execute.")
 
     if not args.execute:
         print("\nDry run complete. Run with --execute to create backport MR and post Jira comment.")
@@ -497,12 +656,14 @@ def main():
         print(f"  EXECUTING BACKPORT — {fix_version_raw}")
         print("=" * 60)
 
-        existing_mr_obj = check_existing_backport_mr(PROJECT_ID_ENCODED, backport_branch, target_branch)
+        existing_mr_obj, existing_mr_state = check_existing_backport_mr(PROJECT_ID_ENCODED, backport_branch, target_branch)
 
-        if existing_mr_obj:
+        if existing_mr_obj and existing_mr_state in ("opened", "merged"):
             backport_mr_url = existing_mr_obj["web_url"]
-            warn(f"Skipping MR creation — backport MR already exists: {backport_mr_url}")
+            warn(f"Skipping MR creation — backport MR already {existing_mr_state}: {backport_mr_url}")
         else:
+            if existing_mr_obj and existing_mr_state == "closed":
+                warn(f"Re-creating backport MR — previous MR was closed: {existing_mr_obj['web_url']}")
             create_backport_branch(PROJECT_ID_ENCODED, backport_branch, target_branch)
 
             conflict_occurred = False
@@ -560,6 +721,12 @@ def main():
                     f"Closes {rec['jira_id']}"
                 )
 
+            if combined_deleted_tc_ids:
+                backport_description += (
+                    f"\n\nNote: The following tests were deleted in this MR and skipped from GM2 check:\n"
+                    + "\n".join(f"  - {dtc}" for dtc in combined_deleted_tc_ids)
+                )
+
             backport_mr = create_mr(
                 PROJECT_ID_ENCODED,
                 backport_branch,
@@ -589,6 +756,9 @@ def main():
             bypass_gm2=args.bypass_gm2,
             bypass_reason=args.bypass_gm2_reason if args.bypass_gm2 else None,
             per_tc_bypasses=per_tc_bypasses if not args.bypass_gm2 else None,
+            deleted_tc_ids=combined_deleted_tc_ids if not args.bypass_gm2 else None,
+            cbb_eligible_tcs=cbb_eligible_tcs if not args.bypass_gm2 else None,
+            skip_gm2_no_ids=skip_gm2_no_ids,
         )
         jira_post_comment(primary_jira_id, comment_body)
         info(f"Jira comment posted to {primary_jira_id}.")

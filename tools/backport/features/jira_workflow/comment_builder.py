@@ -13,10 +13,15 @@ def build_jira_comment(
     bypass_gm2=False,
     bypass_reason=None,
     per_tc_bypasses=None,
+    deleted_tc_ids=None,
+    cbb_eligible_tcs=None,
+    skip_gm2_no_ids=False,
 ):
     risk = "Low" if test_case_count <= 2 else ("Medium" if test_case_count <= 5 else "High")
     dev_checkin_answer = f"Yes - {dev_checkin_jira}" if dev_checkin_jira else "No"
     per_tc_bypasses = per_tc_bypasses or {}
+    deleted_tc_ids = deleted_tc_ids or []
+    cbb_eligible_tcs = cbb_eligible_tcs or {}
 
     if bypass_gm2:
         reason_text = bypass_reason or "Smoke failure / pipeline issue requires immediate backport fix"
@@ -26,19 +31,38 @@ def build_jira_comment(
             f"Reason: {reason_text}\n"
             f"Affected test IDs: {', '.join(tc_ids) if tc_ids else 'N/A'}"
         )
+    elif skip_gm2_no_ids:
+        executed_answer = "SKIPPED — no feature file references found for changed files"
+        gm2_runs_section = (
+            "NOTE: GM2 check skipped. No .feature files referencing the changed files "
+            "were found in the repository scope."
+        )
     else:
         executed_answer = f"{gm2_run_count} times"
-        if per_tc_bypasses:
-            bypassed_count = sum(1 for tc in tc_ids if tc in per_tc_bypasses)
-            executed_answer += f" ({bypassed_count} test(s) selectively bypassed)"
+        special_count = sum(
+            1 for tc in tc_ids
+            if tc in per_tc_bypasses or tc in cbb_eligible_tcs
+        )
+        if special_count:
+            executed_answer += f" ({special_count} test(s) with special eligibility — see GM2 Runs below)"
+
         gm2_links = []
         for tc_id in tc_ids:
             if tc_id in per_tc_bypasses:
                 gm2_links.append(f"{tc_id}: [BYPASSED] — {per_tc_bypasses[tc_id]}")
+            elif tc_id in cbb_eligible_tcs:
+                gm2_links.append(f"{tc_id}: [ELIGIBLE via CBB] — Branch: {cbb_eligible_tcs[tc_id]}")
             else:
                 path = build_dashboard_url(tc_id)
                 short_url = shorten_dashboard_url(path)
                 gm2_links.append(f"{tc_id}: {short_url}")
+
+        if deleted_tc_ids:
+            gm2_links.append("")
+            gm2_links.append("Deleted tests (GM2 check skipped — test removed in this MR):")
+            for dtc in deleted_tc_ids:
+                gm2_links.append(f"  {dtc}: [SKIPPED — deleted]")
+
         gm2_runs_section = "\n".join(gm2_links)
 
     return f"""Original MR: {original_mr_url}

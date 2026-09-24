@@ -36,6 +36,34 @@ def fetch_mr_commits(project_id_encoded, mr_iid):
     return gitlab_get(f"/projects/{project_id_encoded}/merge_requests/{mr_iid}/commits")
 
 
+def fetch_mr_file_changes(project_id_encoded, mr_iid):
+    """Return the raw list of file-change dicts for an MR (includes deleted_file, new_file, renamed_file, diff)."""
+    data = gitlab_get(f"/projects/{project_id_encoded}/merge_requests/{mr_iid}/changes")
+    return data.get("changes", [])
+
+
+def search_blobs(project_id_encoded, query, ref="develop"):
+    """
+    Search repository file contents via GitLab blob search.
+    Returns up to 100 results across paginated calls.
+    Each result has: {basename, path, ref, startline, data}
+    """
+    results = []
+    page = 1
+    while len(results) < 100:
+        batch = gitlab_get(
+            f"/projects/{project_id_encoded}/search",
+            params={"scope": "blobs", "search": query, "ref": ref, "per_page": 20, "page": page},
+        )
+        if not batch:
+            break
+        results.extend(batch)
+        if len(batch) < 20:
+            break
+        page += 1
+    return results
+
+
 def fetch_raw_file_content(project_id_encoded, file_path, ref_sha):
     encoded_path = urllib.parse.quote(file_path, safe="")
     path = f"/projects/{project_id_encoded}/repository/files/{encoded_path}/raw"

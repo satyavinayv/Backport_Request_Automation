@@ -29,8 +29,13 @@ def _extract_xray_ids(text):
             raw = raw.strip()
             if re.match(r"^[A-Za-z0-9_-]+$", raw):
                 ids.add(raw.replace("_", "-").upper())
-    # Bare XR-1234 or DEV-123456
-    for raw in re.findall(r"\b(?:XR|DEV)[_-]\d+\b", text, re.IGNORECASE):
+    # Bare XR-1234 or DEV-123456 — skip Gherkin/diff comment lines to avoid treating
+    # DEV-XXXXXX Jira references in # TODO comments as Xray test IDs.
+    non_comment_text = "\n".join(
+        line for line in text.splitlines()
+        if not re.match(r"^[+\- ]?\s*#", line)
+    )
+    for raw in re.findall(r"\b(?:XR|DEV)[_-]\d+\b", non_comment_text, re.IGNORECASE):
         ids.add(raw.replace("_", "-").upper())
     return sorted(ids)
 

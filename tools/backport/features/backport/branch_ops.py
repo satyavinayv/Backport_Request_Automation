@@ -10,7 +10,16 @@ def create_backport_branch(project_id_encoded, backport_branch, target_branch):
     try:
         return gitlab_post(f"/projects/{project_id_encoded}/repository/branches", payload)
     except requests.exceptions.HTTPError as e:
-        err(f"Failed to create branch '{backport_branch}': {e}")
+        msg = ""
+        try:
+            msg = e.response.json().get("message", str(e))
+        except Exception:
+            msg = str(e)
+        if "already exists" in msg.lower():
+            from utils.log import warn as _warn
+            _warn(f"Branch '{backport_branch}' already exists — reusing for re-created MR.")
+            return None
+        err(f"Failed to create branch '{backport_branch}': {msg}")
 
 
 def cherry_pick_commit(project_id_encoded, commit_sha, backport_branch):
