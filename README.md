@@ -4,7 +4,7 @@
 
 This tool automates the entire GitLab/Jira/GM2 backport workflow — from GM2 eligibility validation to branch creation, cherry-picking, Jira comments, and workflow transitions — all in a single command.
 
-> 📊 **Manager demo:** Open [`demo.html`](./demo.html) in any browser for a 10-slide visual walkthrough of the tool.
+> 📊 **Direct demo:** Open [`docs/demo.html`](./docs/demo.html) in any browser for a 10-slide visual walkthrough of the tool.
 
 ---
 
@@ -30,7 +30,7 @@ In under 60 seconds, the script will:
 7. **Cherry-pick** commits from develop onto the backport branch
 8. **Open** a Backport MR in GitLab with assignee, reviewers, and labels set automatically
 9. **Post** the full approval comment to Jira with dynamic GM2 links
-10. **Transition** Jira workflow: `Running on GM2` → `GM Data Creation` → `MR to GM`
+10. **Transition** Jira workflow to `MR to GM` — handles any starting state automatically
 
 **All of this. One command.**
 
@@ -42,19 +42,30 @@ The script uses a cascade to find TC/Xray IDs, trying each phase before falling 
 
 | Phase | Source | Triggers when |
 |---|---|---|
-| **Phase 1** | `+` lines in the git diff | Always tried first |
+| **Phase 1** | `+` lines in the git diff (`.feature`, `.java`, `.py`, `.groovy` only) | Always tried first |
 | **Phase 2** | Scenario block isolation in modified test files | Phase 1 returns empty |
 | **Fallback** | `Test Cases:` / `Xray IDs:` lines in MR description | Phases 1 & 2 return empty |
 | **Phase 3** | Jira description → OpenSearch `scenario` field lookup | All above return empty |
+| **Phase 4** | Repo file search via GitLab blob API | Non-feature files modified |
+
+### Phase 1 Details
+
+- Only scans test file types (`.feature`, `.java`, `.py`, `.groovy`) — config, XML, and resource files are never scanned to avoid false positives
+- Skips Java/Groovy comment lines (`//`, `/* */`, `* ...`) so Jira ticket references in comments are not treated as test IDs
+- If a `Background:` step is modified, the change affects **all** scenarios in the file — the script automatically collects IDs from every scenario block in that file
 
 ### Phase 3 Detail
 
 Phase 3 is triggered when only non-test files are modified (e.g., helper classes). It:
-1. Parses the Jira ticket description for scenario names — supports two formats:
+1. Parses the Jira ticket description for scenario names — supports three table formats:
+   - **Jira wiki markup**: `|| Test ID/Xray ID || Scenario/Method ||` / `| value | value |`
+   - **Tab-separated**: columns separated by `\t`
+   - **Multi-space**: columns separated by 4+ spaces
    - **Structured labels**: `Scenario: <name>`, `Feature: <name>`, `TC ID: <id>`
-   - **Pipeline failure report table**: tab-separated with `Scenario/Method` column
 2. Queries OpenSearch with `match_phrase` on the `scenario` field
 3. Collects `test_case_id` / `x_ray_id` from hits as the resolved IDs
+4. If OpenSearch is unreachable, bare numeric IDs are **dropped** (fail-closed) — formatted IDs like `TC-XXXX` are always kept
+5. If multiple tests share the same scenario name, a warning is printed so you can verify manually
 
 ---
 
@@ -79,9 +90,10 @@ Up to 50 qualifying runs are fetched; only the **2 most recent** determine eligi
 
 | From | To | Trigger |
 |---|---|---|
-| `Running on GM2` | `GM Data Creation` | Detected by script |
-| `GM Data Creation` | `MR to GM` | Chained immediately |
+| `Running on GM2` | `GM Data Creation` → `MR to GM` | Detected by script (2-hop) |
+| `GM Data Creation` | `MR to GM` | Detected by script (1-hop) |
 | `MR to GM` | — | Already done, skipped |
+| Any other state | `MR to GM` | Direct transition attempted; if unavailable, script warns you to transition manually |
 
 ---
 
@@ -94,7 +106,8 @@ python --version
 
 ### 2. Install Dependencies
 ```powershell
-pip install requests pytest
+pip install -r tools\backport\requirements.txt
+pip install pytest
 ```
 
 ### 3. Company VPN
@@ -122,7 +135,7 @@ cd BackportRequestAutomation
 
 ### Step 2 — Create your credentials file
 ```powershell
-copy tools\backport\.env.example tools\backport\set_env.ps1
+copy tools\backport\set_env.ps1.example tools\backport\set_env.ps1
 ```
 
 Edit `set_env.ps1`:
@@ -138,6 +151,14 @@ $env:BACKPORT_REVIEWERS = 'john.doe,jane.smith'
 
 # Optional — add these labels to every backport MR (alongside original MR labels + "backport")
 $env:BACKPORT_LABELS   = 'team-qa'
+
+# Optional — override defaults (rarely needed)
+$env:BACKPORT_MANAGER_EMAIL = 'vinil.pokala@veeva.com'   # manager who approves the Jira comment
+$env:GITLAB_PROJECT_PATH    = 'veevavault/vaultautomationtests'  # project to search for test files
+
+# Pipeline/config repos where GM2 checks never apply (comma-separated repo names).
+# Default: "automation-platform-pipelines"
+# $env:BACKPORT_PIPELINE_PROJECTS = 'automation-platform-pipelines,infra-pipelines'
 ```
 
 🔒 `set_env.ps1` is in `.gitignore` — it will never be committed. Never share this file or paste its contents anywhere.
@@ -233,10 +254,13 @@ Only run this after Phase 1 shows `Overall: BACKPORT`.
 
 What it does (in addition to Phase 1):
 - Creates backport branch(es) from the release branch
-- Cherry-picks commits (stops and cleans up on conflict)
+- Cherry-picks commits in order; auto-deletes branch on conflict; skips commits already present in the target branch
 - Opens Backport MR in GitLab with assignee, reviewers, and labels set
 - Posts approval comment to Jira with GM2 run links
 - Transitions Jira workflow automatically
+
+> **If a backport MR for the same version already exists and is merged**, the script warns you and asks whether to create an additional backport (e.g., `_v2` branch suffix) or skip.  
+> **If all commits are already present** in the target branch, the branch is cleaned up and the Jira comment is posted without creating a new MR.
 
 ### Custom Reviewers and Labels
 ```powershell
@@ -317,18 +341,41 @@ If neither the code diffs nor the description contain IDs, the script automatica
 
 ---
 
-## 🚨 Error Scenarios & What To Do
+## 🔧 Pipeline / Config Projects (GM2 Auto-Skip)
+
+Some repos (e.g., `automation-platform-pipelines`) contain only Groovy pipeline scripts and will never have test case IDs. For these, GM2 checks are not applicable.
+
+When the configured project is detected as a pipeline project, the script:
+- Skips the GM2 eligibility check entirely (no prompt, no interactive override needed)
+- Shows `Project Type: Pipeline/Config` in the eligibility report
+- Includes the develop MR URL in the report so you can still verify the changes
+
+**Configuration** (in `set_env.ps1` or environment):
+```powershell
+# Default — "automation-platform-pipelines" is auto-detected
+# To add more repos, set the env var:
+$env:BACKPORT_PIPELINE_PROJECTS = 'automation-platform-pipelines,infra-pipelines'
+```
+
+The project name is matched against the last component of `GITLAB_PROJECT_PATH`. For example, if `GITLAB_PROJECT_PATH = 'group/automation-platform-pipelines'`, it is automatically recognized.
+
+---
+
+## 🚨 Error Scenarios & What To Do (Error table)
 
 | Error | Cause | Fix |
 |---|---|---|
 | Missing required environment variables | `set_env.ps1` not loaded | Run `. .\set_env.ps1` |
+| Cannot connect to GitLab/Jira | Not on VPN, or token not set | Connect to company VPN; verify token in `set_env.ps1` |
 | Cannot reach OpenSearch | Not on VPN | Connect to company VPN |
 | No Jira ID found in MR title | MR title missing QA-XXXXXX | Add Jira ID to MR title |
 | No Test Cases or Xray IDs found | All 4 extraction phases failed | Add `Xray IDs: DEV-XXXXXX` to MR description |
 | No Fix Version set in Jira | Jira ticket missing Fix Version | Set Fix Version in Jira before running |
 | Cherry-pick conflict | Changes conflict with release branch | Resolve manually; branch auto-deleted |
+| All commits already present in target | Commits were already cherry-picked | Branch cleaned up; Jira comment still posted — no duplicate MR created |
+| Existing merged backport for same version | Prior backport for this version was merged | Script prompts you: create another (with `_v2` branch suffix) or skip |
 | DO NOT BACKPORT | GM2 runs don't meet eligibility | Wait for more GM2 runs and re-run, OR use `--bypass-gm2-for <TC_ID>` if the failure is known/unrelated |
-| Backport MR already exists | Already created | Script skips creation, posts comment only |
+| Backport MR already open (not merged) | Already created | Script skips creation, posts comment only |
 | GitLab user not found | Wrong username in --reviewers | Check username spelling in GitLab |
 
 ---
@@ -406,10 +453,11 @@ tools/backport/
 │
 ├── features/                              ← Business logic by feature
 │   ├── id_extraction/
-│   │   ├── __init__.py                    ← Resolver: coordinates all 4 phases
-│   │   ├── diff_scanner.py                ← Phase 1: scan +lines in git diff
-│   │   ├── scenario_parser.py             ← Phase 2: scenario block isolation
-│   │   └── jira_test_linker.py            ← Phase 3: Jira description → OpenSearch lookup
+│   │   ├── __init__.py                    ← Resolver: coordinates all phases, MR description fallback
+│   │   ├── diff_scanner.py                ← Phase 1: scan +lines in git diff (test files only, filters comments)
+│   │   ├── scenario_parser.py             ← Phase 2: scenario block isolation (Background-aware)
+│   │   ├── jira_test_linker.py            ← Phase 3: Jira description → OpenSearch lookup
+│   │   └── repo_file_searcher.py          ← Phase 4: GitLab blob search for non-feature file changes
 │   ├── gm2_eligibility/
 │   │   ├── runner.py                      ← Fetch GM2 runs from OpenSearch
 │   │   └── evaluator.py                   ← 2x consecutive PASS eligibility rule
@@ -437,8 +485,11 @@ tools/backport/
 │   ├── test_jira_issue.py
 │   └── test_comment_builder.py
 │
-├── .env.example                           ← Credentials template (safe to commit)
-├── set_env.ps1                            ← Your credentials (NEVER commit this)
+├── requirements.txt                       ← Python dependencies (pip install -r requirements.txt)
+├── set_env.ps1.example                    ← Credentials template (safe to commit)
+└── set_env.ps1                            ← Your credentials (NEVER commit this)
+
+docs/
 └── demo.html                              ← Manager-facing slide deck (open in any browser)
 ```
 

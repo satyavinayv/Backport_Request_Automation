@@ -475,7 +475,7 @@
         <div class="num">7</div>
         <div>
           <div class="label">Cherry-pick Commits</div>
-          <div class="desc">Apply commits in order; auto-delete branch on conflict</div>
+          <div class="desc">Apply commits in order; auto-delete branch on conflict; skip already-applied commits</div>
         </div>
       </div>
       <div class="step">
@@ -710,7 +710,7 @@
           <li>🔒 Credentials never committed (gitignored)</li>
           <li>🤖 CI/CD headless mode (--non-interactive)</li>
           <li>🎯 Selective GM2 bypass with audit trail</li>
-          <li>✔️ 28-test offline test suite (no API calls)</li>
+          <li>✔️ 200+ offline tests — no API calls</li>
           <li>⚡ Handles multi-MR combined backports</li>
         </ul>
       </div>
@@ -729,12 +729,12 @@
           <span class="dim"># 1. Clone &amp; navigate</span><br>
           <span class="cmd">cd C:\Working_Env\BackportRequestAutomation\tools\backport</span><br><br>
           <span class="dim"># 2. Create credentials file</span><br>
-          <span class="cmd">copy .env.example set_env.ps1</span><br>
+          <span class="cmd">copy set_env.ps1.example set_env.ps1</span><br>
           <span class="dim"># &nbsp;&nbsp; Edit set_env.ps1 with your tokens</span><br><br>
           <span class="dim"># 3. Load credentials each session</span><br>
           <span class="cmd">. .\set_env.ps1</span><br><br>
           <span class="dim"># 4. Install dependencies</span><br>
-          <span class="cmd">pip install requests pytest</span>
+          <span class="cmd">pip install -r requirements.txt</span>
         </div>
       </div>
       <div>
