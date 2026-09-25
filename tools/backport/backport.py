@@ -54,7 +54,7 @@ from clients.gitlab import fetch_mr_file_changes
 from features.backport.branch_ops import create_backport_branch, cherry_pick_commit, delete_branch
 from features.backport.mr_ops import check_existing_backport_mr, create_mr, build_label_set
 from features.jira_workflow.issue import fetch_jira_issue, fetch_jira_issue_safe, get_fix_versions, get_caused_by_jira, parse_fix_version
-from features.jira_workflow.transitions import get_jira_status, transition_jira_issue
+from features.jira_workflow.transitions import get_jira_status, transition_jira_issue, ensure_transition_to_mr_to_gm
 from features.jira_workflow.comment_builder import build_jira_comment
 
 
@@ -78,7 +78,7 @@ def _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id
         )
 
     tc_ids, xray_ids, id_source, diff_details = resolve_mr_test_case_ids(
-        PROJECT_ID_ENCODED, mr_iid, mr_description, head_sha=head_sha
+        PROJECT_ID_ENCODED, mr_iid, mr_description, head_sha=head_sha, changes=changes
     )
     all_tc_ids = tc_ids + xray_ids
     phase4_files_searched = []
@@ -600,8 +600,9 @@ def main():
     for c in commits_ordered:
         print(f"  {c['id'][:8]} - {c['title']}")
 
-    # Branch name: join all jira IDs for multi-MR
-    jira_id_str = "_".join(jira_ids)
+    # Use only the primary (first) Jira ID in the branch name for conciseness.
+    # Multi-MR backports still cover all tickets via the MR description's "Closes" lines.
+    jira_id_str = jira_ids[0]
 
     print(f"\nVersions to process: {len(versions_to_process)}")
     for fix_version_raw, version_str, target_branch in versions_to_process:
@@ -763,24 +764,9 @@ def main():
         jira_post_comment(primary_jira_id, comment_body)
         info(f"Jira comment posted to {primary_jira_id}.")
 
-        # Transition all Jira issues to the correct workflow state
+        # Transition all Jira issues to 'MR to GM', regardless of current state.
         for rec in mr_records:
-            jira_id = rec["jira_id"]
-            current_status = get_jira_status(jira_id)
-            info(f"Current Jira status for {jira_id}: {current_status}")
-
-            if current_status == "Running on GM2":
-                info(f"Transitioning {jira_id}: Running on GM2 → GM Data Creation ...")
-                transition_jira_issue(jira_id, "GM Data Creation")
-                info(f"Transitioning {jira_id}: GM Data Creation → MR to GM ...")
-                transition_jira_issue(jira_id, "MR to GM")
-            elif current_status == "GM Data Creation":
-                info(f"Transitioning {jira_id}: GM Data Creation → MR to GM ...")
-                transition_jira_issue(jira_id, "MR to GM")
-            elif current_status == "MR to GM":
-                warn(f"Jira {jira_id} already in 'MR to GM' — skipping transitions.")
-            else:
-                warn(f"Jira {jira_id} is in unexpected status '{current_status}' — skipping transitions.")
+            ensure_transition_to_mr_to_gm(rec["jira_id"])
 
         print(f"  Jira Comment: Posted to {JIRA_URL}/browse/{primary_jira_id}")
 

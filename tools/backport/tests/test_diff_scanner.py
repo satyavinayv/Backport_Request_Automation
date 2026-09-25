@@ -156,6 +156,29 @@ class TestScanAddedLinesForIds:
         assert details[0]["file"] == "some.feature"
         assert "TC-4444" in details[0]["tc_ids"]
 
+    def test_non_test_file_skipped(self):
+        # Files without a test extension (e.g. XML config) must never be scanned.
+        diff = "+@TestCase: TC-9999\n"
+        tc_ids, xray_ids, details = scan_added_lines_for_ids([self._make_change("config.xml", diff)])
+        assert tc_ids == []
+        assert xray_ids == []
+        assert details == []
+
+    def test_java_line_comment_filtered(self):
+        # IDs on Java single-line comment lines must be ignored.
+        diff = "+// @TestCase: TC-1111\n+@TestCase: TC-2222\n"
+        tc_ids, _, _ = scan_added_lines_for_ids([self._make_change("LoginTest.java", diff)])
+        assert "TC-1111" not in tc_ids
+        assert "TC-2222" in tc_ids
+
+    def test_groovy_block_comment_filtered(self):
+        # IDs inside /* ... */ or * continuation lines must be ignored.
+        diff = "+/* @Xray: DEV-3333\n+ * DEV-4444\n+@Xray: DEV-5555\n"
+        _, xray_ids, _ = scan_added_lines_for_ids([self._make_change("Spec.groovy", diff)])
+        assert "DEV-3333" not in xray_ids
+        assert "DEV-4444" not in xray_ids
+        assert "DEV-5555" in xray_ids
+
 
 # ---------------------------------------------------------------------------
 # parse_diff_modified_lines

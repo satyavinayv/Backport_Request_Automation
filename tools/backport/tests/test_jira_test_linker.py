@@ -338,3 +338,40 @@ class TestExtractIdsViaJiraScenarios:
     def test_missing_description_field_returns_empty(self):
         tc_ids, xray_ids, details = extract_ids_via_jira_scenarios({"fields": {}})
         assert tc_ids == []
+
+    def test_numeric_id_dropped_when_opensearch_unreachable(self):
+        # Issue 8 — fail-closed: bare numeric IDs must NOT be accepted when OpenSearch
+        # is down. The ID should be silently dropped (with a warning to the user).
+        desc = (
+            "|| Test ID/Xray ID || Scenario/Method ||\n"
+            "| 541098757 | Validate something |\n"
+        )
+        issue = self._jira_issue(desc)
+        with patch("features.id_extraction.jira_test_linker.opensearch_query",
+                   side_effect=Exception("connection refused")):
+            tc_ids, xray_ids, details = extract_ids_via_jira_scenarios(issue)
+        assert "541098757" not in tc_ids
+        assert tc_ids == []
+
+    def test_collision_warning_emitted_for_shared_scenario_name(self):
+        # Issue 28 — when multiple distinct IDs are returned for a single scenario name,
+        # a warning must be emitted so the user knows to verify manually.
+        issue = self._jira_issue("Scenario: Shared scenario name")
+        multi_hit_response = {
+            "hits": {
+                "hits": [
+                    {"_source": {"test_case_id": "TC-1111", "x_ray_id": "DEV-2222"}},
+                    {"_source": {"test_case_id": "TC-3333", "x_ray_id": ""}},
+                ]
+            }
+        }
+        with patch("features.id_extraction.jira_test_linker.opensearch_query",
+                   return_value=multi_hit_response):
+            with patch("features.id_extraction.jira_test_linker.warn") as mock_warn:
+                tc_ids, xray_ids, details = extract_ids_via_jira_scenarios(issue)
+
+        # Both IDs must still be returned so the user can inspect them
+        assert "TC-1111" in tc_ids or "TC-3333" in tc_ids
+        # A warning referencing the scenario name must have been issued
+        warning_texts = " ".join(str(c) for c in mock_warn.call_args_list)
+        assert "Shared scenario name" in warning_texts or "Multiple tests" in warning_texts

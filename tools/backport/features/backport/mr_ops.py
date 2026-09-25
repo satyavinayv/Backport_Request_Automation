@@ -4,18 +4,34 @@ from utils.log import info
 
 def check_existing_backport_mr(project_id_encoded, backport_branch, target_branch):
     """
-    Check for an existing backport MR on this branch across all states.
+    Check for an existing backport MR on this branch across all states and all pages.
     Returns (mr_object, state) where state is 'opened', 'merged', or 'closed'.
     Returns (None, None) if not found.
+
+    Paginates through all results so the match is never missed in busy projects
+    where the first 100 MRs on a target branch do not include the backport MR.
+    When a backport MR is found in 'merged' state, Jira comment + transitions are
+    still executed on the calling side to handle the case where the MR was merged
+    but the Jira issue was never updated (e.g. a previous run crashed mid-flight).
     """
     for state in ("opened", "merged", "closed"):
-        mrs = gitlab_get(
-            f"/projects/{project_id_encoded}/merge_requests",
-            params={"state": state, "target_branch": target_branch, "per_page": 100},
-        )
-        for mr in mrs:
-            if mr.get("source_branch") == backport_branch:
-                return mr, state
+        page = 1
+        while True:
+            mrs = gitlab_get(
+                f"/projects/{project_id_encoded}/merge_requests",
+                params={
+                    "state": state,
+                    "target_branch": target_branch,
+                    "per_page": 100,
+                    "page": page,
+                },
+            )
+            for mr in mrs:
+                if mr.get("source_branch") == backport_branch:
+                    return mr, state
+            if len(mrs) < 100:
+                break
+            page += 1
     return None, None
 
 

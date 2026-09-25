@@ -4,12 +4,17 @@ Tests for features/id_extraction/scenario_parser.py
 Covers:
   - extract_scenario_block_ids: normal block, multiple scenarios (only modified
     block returned), scenario at line index 0 (bug fix), no scenario header,
-    Examples table IDs, duplicate block deduplication
+    Examples table IDs, duplicate block deduplication,
+    Background modification → all scenarios returned
   - scan_scenario_blocks: file type filtering, no modified lines skipped
 """
 import pytest
 from unittest.mock import patch
-from features.id_extraction.scenario_parser import extract_scenario_block_ids, scan_scenario_blocks
+from features.id_extraction.scenario_parser import (
+    extract_scenario_block_ids,
+    scan_scenario_blocks,
+    _find_all_scenario_blocks,
+)
 
 
 FEATURE_CONTENT = """\
@@ -139,3 +144,98 @@ class TestScanScenarioBlocks:
         with patch("features.id_extraction.scenario_parser.fetch_raw_file_content") as mock_fetch:
             scan_scenario_blocks("proj", changes, "abc123")
         mock_fetch.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Background block modification → all scenarios affected
+# ---------------------------------------------------------------------------
+
+BACKGROUND_FEATURE = """\
+Feature: Shared setup
+
+  Background:
+    Given I am logged in
+    And the database is clean
+
+  @TestCase: TC-AAA
+  Scenario: First action
+    When I do something
+    Then result A
+
+  @TestCase: TC-BBB
+  Scenario: Second action
+    When I do something else
+    Then result B
+
+  @Xray: DEV-9999
+  Scenario Outline: Parameterised
+    When I use <param>
+    Then result C
+  Examples:
+    | param |
+    | x     |
+"""
+
+
+class TestBackgroundModification:
+    def test_background_change_returns_all_scenario_ids(self):
+        # Line 4 is "Given I am logged in" inside Background
+        tc_ids, xray_ids, blocks = extract_scenario_block_ids(BACKGROUND_FEATURE, [4])
+        assert "TC-AAA" in tc_ids
+        assert "TC-BBB" in tc_ids
+        assert "DEV-9999" in xray_ids
+
+    def test_background_change_all_blocks_returned(self):
+        # All 3 scenario blocks should appear in matched_blocks
+        _, _, blocks = extract_scenario_block_ids(BACKGROUND_FEATURE, [4])
+        assert len(blocks) == 3
+
+    def test_background_second_step_also_triggers_all(self):
+        # Line 5 ("And the database is clean") is also in Background
+        tc_ids, _, _ = extract_scenario_block_ids(BACKGROUND_FEATURE, [5])
+        assert "TC-AAA" in tc_ids
+        assert "TC-BBB" in tc_ids
+
+    def test_background_plus_scenario_change_no_duplicates(self):
+        # Modifying both a Background line and a line inside Scenario 1:
+        # TC-AAA must appear exactly once even though it is found via both paths.
+        tc_ids, _, blocks = extract_scenario_block_ids(BACKGROUND_FEATURE, [4, 9])
+        assert tc_ids.count("TC-AAA") == 1
+        assert "TC-BBB" in tc_ids
+
+    def test_no_background_unmodified_scenarios_not_returned(self):
+        # Modifying only a line inside Scenario 1 should NOT return TC-BBB
+        tc_ids, _, _ = extract_scenario_block_ids(BACKGROUND_FEATURE, [9])
+        assert "TC-AAA" in tc_ids
+        assert "TC-BBB" not in tc_ids
+
+    def test_background_no_scenarios_returns_empty(self):
+        content = "Feature: Empty\n\n  Background:\n    Given nothing\n"
+        tc_ids, xray_ids, blocks = extract_scenario_block_ids(content, [3])
+        assert tc_ids == []
+        assert xray_ids == []
+        assert blocks == []
+
+
+# ---------------------------------------------------------------------------
+# _find_all_scenario_blocks helper
+# ---------------------------------------------------------------------------
+
+class TestFindAllScenarioBlocks:
+    def test_returns_one_block_per_scenario(self):
+        blocks = _find_all_scenario_blocks(BACKGROUND_FEATURE.splitlines())
+        assert len(blocks) == 3
+
+    def test_each_block_includes_tags(self):
+        lines = BACKGROUND_FEATURE.splitlines()
+        blocks = _find_all_scenario_blocks(lines)
+        # First block start should be the @TestCase: TC-AAA tag line (index 6)
+        first_start, _ = blocks[0]
+        assert "@TestCase" in lines[first_start]
+
+    def test_empty_file_returns_no_blocks(self):
+        assert _find_all_scenario_blocks([]) == []
+
+    def test_file_with_no_scenarios_returns_empty(self):
+        lines = ["Feature: Nothing", "", "  Background:", "    Given step"]
+        assert _find_all_scenario_blocks(lines) == []

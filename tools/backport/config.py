@@ -4,8 +4,8 @@ GITLAB_URL = os.environ.get("GITLAB_URL", "https://gitlab.veevadev.com")
 JIRA_URL = os.environ.get("JIRA_URL", "https://jira.veevadev.com")
 OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "https://autoinfra-es.vaultdev.com:9200")
 
-MANAGER_NAME = "vinil.pokala@veeva.com"
-PROJECT_PATH = "veevavault/vaultautomationtests"
+MANAGER_NAME = os.environ.get("BACKPORT_MANAGER_EMAIL", "vinil.pokala@veeva.com")
+PROJECT_PATH = os.environ.get("GITLAB_PROJECT_PATH", "veevavault/vaultautomationtests")
 PROJECT_ID_ENCODED = PROJECT_PATH.replace("/", "%2F")
 
 # Comma-separated GitLab usernames to add as reviewers on every backport MR.

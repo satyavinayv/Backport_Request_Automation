@@ -92,7 +92,7 @@ def _is_valid_body_row(line, table_format, header_col_count):
 
     Wiki   — must start with a single '|' (not '||')
     Tab    — must contain at least one tab character
-    Space  — multi-space token count must be within ±2 of the header's column count
+    Space  — multi-space token count must be within ±1 of the header's column count
              (eliminates free-text / stack-trace lines that happen to have large numbers)
     """
     stripped = line.strip()
@@ -228,7 +228,9 @@ def _validate_numeric_ids(raw_tc_ids):
                 warn(f"Phase 3: Numeric ID '{tc}' has no OpenSearch records "
                      "— likely a build/manifest number, not a TC ID. Skipping.")
         except Exception:
-            validated.append(tc)  # fail-open
+            warn(f"Phase 3: OpenSearch unreachable — dropping numeric ID '{tc}' to avoid false positives. "
+                 "Verify this ID manually if it is a real TC ID.")
+            # fail-closed: never accept an unvalidated bare numeric ID
     return validated
 
 
@@ -245,7 +247,7 @@ def _fetch_ids_by_scenario(scenario_name):
     }
     try:
         data = opensearch_query(payload)
-    except SystemExit:
+    except Exception:
         return [], []
 
     hits = data.get("hits", {}).get("hits", [])
@@ -259,6 +261,15 @@ def _fetch_ids_by_scenario(scenario_name):
             tc_ids.add(tc.replace("_", "-").upper())
         if xr:
             xray_ids.add(xr.replace("_", "-").upper())
+
+    if len(tc_ids) + len(xray_ids) > 1:
+        label = scenario_name if len(scenario_name) <= 70 else scenario_name[:67] + "..."
+        all_ids = ", ".join(sorted(tc_ids | xray_ids))
+        warn(
+            f"Phase 3: Scenario '{label}' matched {len(tc_ids) + len(xray_ids)} test ID(s): {all_ids}\n"
+            "  Multiple tests share this scenario name — verify the correct IDs manually.\n"
+            "  Add the correct IDs to the MR description (Xray IDs: DEV-XXXXX) to avoid ambiguity."
+        )
 
     return sorted(tc_ids), sorted(xray_ids)
 

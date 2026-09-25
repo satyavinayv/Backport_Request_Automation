@@ -3,13 +3,46 @@ from clients.gitlab import fetch_raw_file_content
 from features.id_extraction.diff_scanner import parse_diff_modified_lines, _extract_tc_ids, _extract_xray_ids
 
 
+def _find_all_scenario_blocks(lines):
+    """Return (start_idx, end_idx) for every Scenario/Scenario Outline block in the file."""
+    total_lines = len(lines)
+    blocks = []
+    i = 0
+    while i < total_lines:
+        if re.match(r"^\s*(Scenario|Scenario Outline):", lines[i], re.IGNORECASE):
+            sc_start = i
+            while sc_start > 0 and lines[sc_start - 1].strip().startswith("@"):
+                sc_start -= 1
+            sc_end = i
+            while sc_end < total_lines - 1:
+                next_line = lines[sc_end + 1]
+                if re.match(r"^\s*(Scenario|Scenario Outline):", next_line, re.IGNORECASE) or \
+                   (next_line.strip().startswith("@") and any(
+                       re.match(r"^\s*(Scenario|Scenario Outline):", lines[k], re.IGNORECASE)
+                       for k in range(sc_end + 1, min(sc_end + 10, total_lines))
+                   )):
+                    break
+                sc_end += 1
+            blocks.append((sc_start, sc_end))
+            i = sc_end + 1
+        else:
+            i += 1
+    return blocks
+
+
 def extract_scenario_block_ids(file_content, modified_line_nums):
-    """Isolate only the Scenario/Scenario Outline blocks touched by changed lines."""
+    """Isolate only the Scenario/Scenario Outline blocks touched by changed lines.
+
+    If a modified line sits inside a Background block (no enclosing Scenario header found
+    above it), all scenarios in the file are returned — a Background change affects every
+    scenario that uses it.
+    """
     lines = file_content.splitlines()
     total_lines = len(lines)
     tc_ids, xray_ids = set(), set()
     matched_blocks = []
     processed_ranges = set()
+    background_triggered = False
 
     for mod_line in modified_line_nums:
         idx = mod_line - 1
@@ -17,7 +50,6 @@ def extract_scenario_block_ids(file_content, modified_line_nums):
             continue
 
         # Walk up to find the enclosing Scenario header (including its @tags).
-        # BUG FIX: use >= 0 so line index 0 (first line of file) is not skipped.
         start_idx = idx
         while start_idx >= 0:
             if re.match(r"^\s*(Scenario|Scenario Outline):", lines[start_idx], re.IGNORECASE):
@@ -25,6 +57,12 @@ def extract_scenario_block_ids(file_content, modified_line_nums):
                     start_idx -= 1
                 break
             start_idx -= 1
+
+        if start_idx < 0:
+            # No Scenario header found above — modified line is in a Background block.
+            # Background steps run before every scenario, so all scenarios are affected.
+            background_triggered = True
+            continue
 
         # Walk down to end of block (stop before next Scenario header or its @tags)
         end_idx = idx
@@ -44,9 +82,6 @@ def extract_scenario_block_ids(file_content, modified_line_nums):
         processed_ranges.add(block_key)
 
         block_text = "\n".join(lines[start_idx: end_idx + 1])
-
-        # BUG FIX: use shared helpers — both annotation and bare patterns,
-        # additive (not mutually exclusive), multi-ID aware.
         found_tcs = _extract_tc_ids(block_text)
         found_xrays = _extract_xray_ids(block_text)
 
@@ -60,6 +95,25 @@ def extract_scenario_block_ids(file_content, modified_line_nums):
                 "xray_ids": found_xrays,
             })
 
+    if background_triggered:
+        for sc_start, sc_end in _find_all_scenario_blocks(lines):
+            block_key = (sc_start, sc_end)
+            if block_key in processed_ranges:
+                continue
+            processed_ranges.add(block_key)
+            block_text = "\n".join(lines[sc_start: sc_end + 1])
+            found_tcs = _extract_tc_ids(block_text)
+            found_xrays = _extract_xray_ids(block_text)
+            if found_tcs or found_xrays:
+                tc_ids.update(found_tcs)
+                xray_ids.update(found_xrays)
+                matched_blocks.append({
+                    "start_line": sc_start + 1,
+                    "end_line": sc_end + 1,
+                    "tc_ids": found_tcs,
+                    "xray_ids": found_xrays,
+                })
+
     return sorted(tc_ids), sorted(xray_ids), matched_blocks
 
 
@@ -72,7 +126,7 @@ def scan_scenario_blocks(project_id_encoded, changes, head_sha):
     for change in changes:
         file_path = change.get("new_path", "")
         diff_text = change.get("diff", "")
-        if not file_path.endswith((".feature", ".java", ".py")) or not diff_text:
+        if not file_path.endswith((".feature", ".java", ".py", ".groovy")) or not diff_text:
             continue
 
         mod_lines = parse_diff_modified_lines(diff_text)

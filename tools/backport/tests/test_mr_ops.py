@@ -111,6 +111,34 @@ class TestCheckExistingBackportMr:
         assert mr == fake_mr
         assert state == "closed"
 
+    def test_pagination_match_on_second_page(self):
+        """MR not in first 100 results must be found on page 2."""
+        target_branch = "r26.2.3_gm/user/QA-1_SU"
+        fake_mr = {"source_branch": target_branch, "web_url": "https://gitlab/mr/99"}
+        page_1 = [{"source_branch": f"other-branch-{i}"} for i in range(100)]
+        page_2 = [fake_mr]
+
+        call_count = {"n": 0}
+
+        def fake_get(path, params=None):
+            call_count["n"] += 1
+            state = params.get("state", "")
+            page = params.get("page", 1)
+            if state == "opened":
+                if page == 1:
+                    return page_1
+                if page == 2:
+                    return page_2
+            return []
+
+        with patch("features.backport.mr_ops.gitlab_get", side_effect=fake_get):
+            mr, state = check_existing_backport_mr("proj", target_branch, "release/26.2.3")
+
+        assert mr == fake_mr
+        assert state == "opened"
+        # Must have made at least 2 calls for the 'opened' state (page 1 and page 2)
+        assert call_count["n"] >= 2
+
 
 class TestCreateMr:
     def _call(self, **kwargs):

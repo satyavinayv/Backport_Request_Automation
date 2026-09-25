@@ -61,19 +61,23 @@ def extract_test_case_ids(description):
     return tc_ids, xray_ids
 
 
-def extract_ids_from_diff(project_id_encoded, mr_iid, head_sha=None):
+def extract_ids_from_diff(project_id_encoded, mr_iid, head_sha=None, changes=None):
     """
     Phase 1: scan +lines in the git patch directly.
     Phase 2: fallback to scenario-block isolation on modified test files.
+
+    Pass `changes` if already fetched (e.g. from fetch_mr_file_changes) to avoid
+    a duplicate API call — the function fetches it itself only when changes=None.
     """
     info(f"Scanning MR !{mr_iid} code diffs for Test IDs...")
-    try:
-        mr_changes = gitlab_get(f"/projects/{project_id_encoded}/merge_requests/{mr_iid}/changes")
-    except Exception as e:
-        warn(f"Could not fetch MR changes from GitLab: {e}")
-        return [], [], []
+    if changes is None:
+        try:
+            mr_changes = gitlab_get(f"/projects/{project_id_encoded}/merge_requests/{mr_iid}/changes")
+        except Exception as e:
+            warn(f"Could not fetch MR changes from GitLab: {e}")
+            return [], [], []
+        changes = mr_changes.get("changes", [])
 
-    changes = mr_changes.get("changes", [])
     tc_ids, xray_ids, matches_detail = scan_added_lines_for_ids(changes)
 
     if not tc_ids and not xray_ids and head_sha:
@@ -86,9 +90,9 @@ def extract_ids_from_diff(project_id_encoded, mr_iid, head_sha=None):
     return sorted(set(tc_ids)), sorted(set(xray_ids)), matches_detail
 
 
-def resolve_mr_test_case_ids(project_id_encoded, mr_iid, description, head_sha=None):
+def resolve_mr_test_case_ids(project_id_encoded, mr_iid, description, head_sha=None, changes=None):
     """Primary resolver: code diffs first, MR description as fallback."""
-    tc_ids, xray_ids, details = extract_ids_from_diff(project_id_encoded, mr_iid, head_sha)
+    tc_ids, xray_ids, details = extract_ids_from_diff(project_id_encoded, mr_iid, head_sha, changes=changes)
 
     if tc_ids or xray_ids:
         info("Extracted Test IDs directly from MR code files.")

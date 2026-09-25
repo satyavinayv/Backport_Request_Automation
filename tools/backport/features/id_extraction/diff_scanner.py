@@ -5,8 +5,20 @@ import re
 # Shared ID extraction helpers (used by both diff_scanner and scenario_parser)
 # ---------------------------------------------------------------------------
 
+_COMMENT_LINE_RE = re.compile(r"^[+\- ]?\s*(#|//|/\*|\* )")
+
+
+def _remove_comment_lines(text):
+    """Strip lines that are purely comment lines (Gherkin #, Java/Groovy // /* *)."""
+    return "\n".join(
+        line for line in text.splitlines()
+        if not _COMMENT_LINE_RE.match(line)
+    )
+
+
 def _extract_tc_ids(text):
     """Extract all TC IDs from any text — annotation and bare patterns, multi-ID aware."""
+    text = _remove_comment_lines(text)
     ids = set()
     # @TestCase: TC-1234, TC-5678  (multi-value annotation — [ \t] avoids cross-line greed)
     for match in re.finditer(r"@TestCase:\s*([A-Za-z0-9_, \t-]+)", text, re.IGNORECASE):
@@ -22,6 +34,7 @@ def _extract_tc_ids(text):
 
 def _extract_xray_ids(text):
     """Extract all Xray IDs from any text — annotation and bare patterns, multi-ID aware."""
+    text = _remove_comment_lines(text)
     ids = set()
     # @Xray: XR-1234, DEV-5678  (multi-value annotation — [ \t] avoids cross-line greed)
     for match in re.finditer(r"@Xray(?:ID)?:\s*([A-Za-z0-9_, \t-]+)", text, re.IGNORECASE):
@@ -29,13 +42,8 @@ def _extract_xray_ids(text):
             raw = raw.strip()
             if re.match(r"^[A-Za-z0-9_-]+$", raw):
                 ids.add(raw.replace("_", "-").upper())
-    # Bare XR-1234 or DEV-123456 — skip Gherkin/diff comment lines to avoid treating
-    # DEV-XXXXXX Jira references in # TODO comments as Xray test IDs.
-    non_comment_text = "\n".join(
-        line for line in text.splitlines()
-        if not re.match(r"^[+\- ]?\s*#", line)
-    )
-    for raw in re.findall(r"\b(?:XR|DEV)[_-]\d+\b", non_comment_text, re.IGNORECASE):
+    # Bare XR-1234 or DEV-123456
+    for raw in re.findall(r"\b(?:XR|DEV)[_-]\d+\b", text, re.IGNORECASE):
         ids.add(raw.replace("_", "-").upper())
     return sorted(ids)
 
@@ -44,8 +52,15 @@ def _extract_xray_ids(text):
 # Phase 1: scan only +lines in the git patch
 # ---------------------------------------------------------------------------
 
+_TEST_FILE_EXTENSIONS = (".feature", ".java", ".py", ".groovy")
+
+
 def scan_added_lines_for_ids(changes):
-    """Scan newly added (+) lines in each file diff for TC / Xray IDs."""
+    """Scan newly added (+) lines in each file diff for TC / Xray IDs.
+
+    Only processes test file types to avoid false positives from config,
+    resource, or binary files that happen to contain DEV-XXXXX references.
+    """
     tc_ids = []
     xray_ids = []
     matches_detail = []
@@ -53,7 +68,7 @@ def scan_added_lines_for_ids(changes):
     for change in changes:
         file_path = change.get("new_path", "unknown")
         diff_text = change.get("diff", "")
-        if not diff_text:
+        if not file_path.endswith(_TEST_FILE_EXTENSIONS) or not diff_text:
             continue
 
         for line in diff_text.splitlines():

@@ -4,9 +4,19 @@ from config import GITLAB_URL, get_gitlab_headers
 from utils.log import err, warn, info
 
 
+def _connection_err(exc):
+    err(
+        f"Cannot connect to GitLab — check your VPN connection and that "
+        f"GITLAB_URL / GITLAB_PRIVATE_TOKEN are set correctly.\nDetail: {exc}"
+    )
+
+
 def gitlab_get(path, params=None):
     url = f"{GITLAB_URL}/api/v4{path}"
-    resp = requests.get(url, headers=get_gitlab_headers(), params=params, timeout=30)
+    try:
+        resp = requests.get(url, headers=get_gitlab_headers(), params=params, timeout=30)
+    except requests.exceptions.ConnectionError as exc:
+        _connection_err(exc)
     if resp.status_code == 404:
         err(f"GitLab 404: {url}")
     resp.raise_for_status()
@@ -15,14 +25,20 @@ def gitlab_get(path, params=None):
 
 def gitlab_get_raw(path, params=None):
     url = f"{GITLAB_URL}/api/v4{path}"
-    resp = requests.get(url, headers=get_gitlab_headers(), params=params, timeout=30)
+    try:
+        resp = requests.get(url, headers=get_gitlab_headers(), params=params, timeout=30)
+    except requests.exceptions.ConnectionError as exc:
+        _connection_err(exc)
     resp.raise_for_status()
     return resp.text
 
 
 def gitlab_post(path, payload):
     url = f"{GITLAB_URL}/api/v4{path}"
-    resp = requests.post(url, headers=get_gitlab_headers(), json=payload, timeout=30)
+    try:
+        resp = requests.post(url, headers=get_gitlab_headers(), json=payload, timeout=30)
+    except requests.exceptions.ConnectionError as exc:
+        _connection_err(exc)
     resp.raise_for_status()
     return resp.json()
 

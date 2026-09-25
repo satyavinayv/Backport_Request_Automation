@@ -20,6 +20,18 @@ _SCOPE_BOUNDARIES = {"src", "test", "tests", "resources", "features", "main", "j
 
 _MAX_FEATURE_FILES = 20   # cap per changed file to avoid runaway searches
 
+# File types that are never referenced by name inside .feature files.
+# Searching for these in the repo would only produce false positives.
+_PHASE4_SKIP_EXTENSIONS = {
+    ".pdf", ".xlsx", ".xls", ".xlsm", ".docx", ".doc", ".pptx", ".ppt", ".ods", ".odt",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".ico", ".tiff", ".tif", ".webp",
+    ".mp3", ".mp4", ".avi", ".wav", ".mov", ".mkv", ".flv", ".webm",
+    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".jar", ".war", ".ear",
+    ".class", ".bin", ".exe", ".dll", ".so", ".dylib", ".pyc",
+    ".ttf", ".woff", ".woff2", ".eot",
+    ".xml",  # XML config/data files are not referenced directly in feature steps
+}
+
 
 def infer_search_scope(file_path: str) -> str:
     """
@@ -51,6 +63,11 @@ def search_repo_for_file_usages(project_id_encoded, file_path, ref="develop"):
       details: list of {file, tc_ids, xray_ids} for each matched feature file
       total_feature_hits: raw hit count before the 20-file cap
     """
+    _, ext = os.path.splitext(file_path.lower())
+    if ext in _PHASE4_SKIP_EXTENSIONS:
+        info(f"  Phase 4: skipping '{file_path}' — binary/document/config files are never referenced in feature steps.")
+        return [], [], [], 0
+
     filename = os.path.basename(file_path)
     scope = infer_search_scope(file_path)
 

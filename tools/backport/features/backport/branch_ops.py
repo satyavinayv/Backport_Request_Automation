@@ -26,6 +26,9 @@ def cherry_pick_commit(project_id_encoded, commit_sha, backport_branch):
     info(f"  Cherry-picking {commit_sha[:8]} onto '{backport_branch}' ...")
     payload = {"branch": backport_branch}
     url = f"{GITLAB_URL}/api/v4/projects/{project_id_encoded}/repository/commits/{commit_sha}/cherry_pick"
+    # Uses raw requests.post (not gitlab_post) intentionally: the cherry-pick endpoint returns
+    # HTTP 400 on a conflict, and we must read the response body to detect it. gitlab_post calls
+    # raise_for_status() immediately, which would throw before we can inspect the 400 body.
     resp = requests.post(url, headers=get_gitlab_headers(), json=payload, timeout=30)
     if resp.status_code == 400:
         data = resp.json()
@@ -46,4 +49,10 @@ def delete_branch(project_id_encoded, branch_name):
         f"{GITLAB_URL}/api/v4/projects/{project_id_encoded}"
         f"/repository/branches/{requests.utils.quote(branch_name, safe='')}"
     )
-    requests.delete(url, headers=get_gitlab_headers(), timeout=30)
+    resp = requests.delete(url, headers=get_gitlab_headers(), timeout=30)
+    if not resp.ok:
+        from utils.log import warn as _warn
+        _warn(
+            f"Failed to delete branch '{branch_name}' (HTTP {resp.status_code}). "
+            "The branch may still exist — delete it manually before re-running to avoid conflicts."
+        )

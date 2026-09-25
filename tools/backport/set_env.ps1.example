@@ -1,0 +1,13 @@
+# set_env.ps1.example
+# Copy this file to set_env.ps1, fill in your values, and run it in PowerShell
+# before executing backport.py.  set_env.ps1 is in .gitignore — never commit it.
+
+$env:GITLAB_TOKEN       = "your-gitlab-personal-access-token"
+$env:GITLAB_URL         = "https://gitlab.veevadev.com"
+$env:JIRA_URL           = "https://jira.veevadev.com"
+$env:JIRA_PAT           = "your-jira-personal-access-token"
+$env:OPENSEARCH_URL     = "https://autoinfra-es.vaultdev.com:9200"
+
+# Optional overrides (defaults shown)
+$env:BACKPORT_MANAGER_EMAIL = "vinil.pokala@veeva.com"
+$env:GITLAB_PROJECT_PATH    = "veevavault/vaultautomationtests"
