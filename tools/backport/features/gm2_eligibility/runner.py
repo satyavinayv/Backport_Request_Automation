@@ -7,40 +7,48 @@ from utils.log import info
 _GM2_FETCH_SIZE = 50
 
 
-def fetch_gm2_runs(tc_id, merged_at_iso):
-    """Query OpenSearch for GM2 runs of a test case after the MR merge timestamp."""
-    info(f"  Querying GM2 runs for {tc_id} after {merged_at_iso} ...")
+def fetch_gm2_runs(tc_id, merged_at_iso, scenario_name=None, row=None):
+    """
+    Query OpenSearch for GM2 runs of a test case after the MR merge timestamp.
+
+    scenario_name: when set, restricts results to runs whose 'scenario' field matches
+        exactly — prevents runs from a different scenario sharing the same TC/Xray ID
+        from polluting the eligibility evaluation.
+    row: 1-based integer; when set, restricts results to that specific Scenario Outline
+        row — prevents rows unrelated to the change from polluting the evaluation.
+    """
+    ctx_label = _ctx_label(scenario_name, row)
+    info(f"  Querying GM2 runs for {tc_id}{ctx_label} after {merged_at_iso} ...")
+
+    filters = [
+        {"match_phrase": {"environment": "GM2"}},
+        {
+            "range": {
+                "@timestamp": {
+                    "gte": merged_at_iso,
+                    "lte": "now",
+                }
+            }
+        },
+        {
+            "bool": {
+                "should": [
+                    {"match_phrase": {"x_ray_id": tc_id}},
+                    {"match_phrase": {"test_case_id": tc_id}},
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+    ]
+    if scenario_name:
+        filters.append({"match_phrase": {"scenario": scenario_name}})
+    if row is not None:
+        filters.append({"term": {"row": row}})
+
     payload = {
         "size": _GM2_FETCH_SIZE,
         "_source": {"excludes": []},
-        "query": {
-            "bool": {
-                "filter": [
-                    {"match_phrase": {"environment": "GM2"}},
-                    {
-                        "range": {
-                            "@timestamp": {
-                                "gte": merged_at_iso,
-                                "lte": "now",
-                            }
-                        }
-                    },
-                    {
-                        "bool": {
-                            "should": [
-                                {"match_phrase": {"x_ray_id": tc_id}},
-                                {"match_phrase": {"test_case_id": tc_id}},
-                            ],
-                            "minimum_should_match": 1,
-                        }
-                    },
-                ]
-            }
-        },
-        # BUG FIX: sort descending so we always get the MOST RECENT runs first,
-        # then reverse before returning so the list is oldest→newest for the evaluator.
-        # Previously: ascending + size:10 returned the 10 oldest runs, causing
-        # results[-2:] to miss the actual latest runs when >10 existed.
+        "query": {"bool": {"filter": filters}},
         "sort": [{"@timestamp": {"order": "desc"}}],
     }
 
@@ -79,32 +87,38 @@ def fetch_gm2_runs(tc_id, merged_at_iso):
     return runs
 
 
-def classify_gm2_absence(tc_id, merged_at_iso):
+def classify_gm2_absence(tc_id, merged_at_iso, scenario_name=None, row=None):
     """
     Determine why fetch_gm2_runs returned an empty list.
-    Returns 'NO_HISTORY'     — zero GM2 runs exist post-merge (new test).
+    Returns 'NO_HISTORY'     — zero GM2 runs exist post-merge (new test / new row).
     Returns 'CBB_RERUN_ONLY' — runs exist but every one is a rerun or CBB.
+
+    scenario_name and row are forwarded so the absence check is scoped to the same
+    context as fetch_gm2_runs, avoiding incorrect CBB_RERUN_ONLY diagnoses when
+    a different scenario or row has runs for the same ID.
     """
+    filters = [
+        {"match_phrase": {"environment": "GM2"}},
+        {"range": {"@timestamp": {"gte": merged_at_iso, "lte": "now"}}},
+        {
+            "bool": {
+                "should": [
+                    {"match_phrase": {"x_ray_id": tc_id}},
+                    {"match_phrase": {"test_case_id": tc_id}},
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+    ]
+    if scenario_name:
+        filters.append({"match_phrase": {"scenario": scenario_name}})
+    if row is not None:
+        filters.append({"term": {"row": row}})
+
     payload = {
         "size": 1,
         "track_total_hits": True,
-        "query": {
-            "bool": {
-                "filter": [
-                    {"match_phrase": {"environment": "GM2"}},
-                    {"range": {"@timestamp": {"gte": merged_at_iso, "lte": "now"}}},
-                    {
-                        "bool": {
-                            "should": [
-                                {"match_phrase": {"x_ray_id": tc_id}},
-                                {"match_phrase": {"test_case_id": tc_id}},
-                            ],
-                            "minimum_should_match": 1,
-                        }
-                    },
-                ]
-            }
-        },
+        "query": {"bool": {"filter": filters}},
     }
     data = opensearch_query(payload)
     total = data.get("hits", {}).get("total", {})
@@ -112,34 +126,38 @@ def classify_gm2_absence(tc_id, merged_at_iso):
     return "NO_HISTORY" if count == 0 else "CBB_RERUN_ONLY"
 
 
-def fetch_gm2_runs_cbb(tc_id, merged_at_iso, cbb_branch):
+def fetch_gm2_runs_cbb(tc_id, merged_at_iso, cbb_branch, scenario_name=None, row=None):
     """
     Query OpenSearch for GM2 runs filtered by build_branches (CBB branch).
     The isCBB filter is removed entirely — build_branches scopes the results.
     rerun_count=0 still applied to exclude reruns.
     """
-    info(f"  Querying CBB GM2 runs for {tc_id} on branch '{cbb_branch}' ...")
+    ctx_label = _ctx_label(scenario_name, row)
+    info(f"  Querying CBB GM2 runs for {tc_id}{ctx_label} on branch '{cbb_branch}' ...")
+
+    filters = [
+        {"match_phrase": {"environment": "GM2"}},
+        {"range": {"@timestamp": {"gte": merged_at_iso, "lte": "now"}}},
+        {
+            "bool": {
+                "should": [
+                    {"match_phrase": {"x_ray_id": tc_id}},
+                    {"match_phrase": {"test_case_id": tc_id}},
+                ],
+                "minimum_should_match": 1,
+            }
+        },
+        {"match_phrase": {"build_branches": cbb_branch}},
+    ]
+    if scenario_name:
+        filters.append({"match_phrase": {"scenario": scenario_name}})
+    if row is not None:
+        filters.append({"term": {"row": row}})
+
     payload = {
         "size": _GM2_FETCH_SIZE,
         "_source": {"excludes": []},
-        "query": {
-            "bool": {
-                "filter": [
-                    {"match_phrase": {"environment": "GM2"}},
-                    {"range": {"@timestamp": {"gte": merged_at_iso, "lte": "now"}}},
-                    {
-                        "bool": {
-                            "should": [
-                                {"match_phrase": {"x_ray_id": tc_id}},
-                                {"match_phrase": {"test_case_id": tc_id}},
-                            ],
-                            "minimum_should_match": 1,
-                        }
-                    },
-                    {"match_phrase": {"build_branches": cbb_branch}},
-                ]
-            }
-        },
+        "query": {"bool": {"filter": filters}},
         "sort": [{"@timestamp": {"order": "desc"}}],
     }
     data = opensearch_query(payload)
@@ -167,3 +185,14 @@ def fetch_gm2_runs_cbb(tc_id, merged_at_iso, cbb_branch):
         })
     runs.reverse()
     return runs
+
+
+def _ctx_label(scenario_name, row):
+    """Format a short context label for log messages."""
+    parts = []
+    if scenario_name:
+        name = scenario_name if len(scenario_name) <= 40 else scenario_name[:37] + "..."
+        parts.append(f"scenario='{name}'")
+    if row is not None:
+        parts.append(f"row={row}")
+    return f" [{', '.join(parts)}]" if parts else ""

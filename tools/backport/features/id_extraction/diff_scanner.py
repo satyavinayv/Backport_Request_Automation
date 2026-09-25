@@ -106,6 +106,8 @@ def parse_diff_modified_lines(diff_text):
             modified_lines.append(current_new_line)
         elif line.startswith("-") and not line.startswith("---"):
             pass  # deleted lines don't advance the new-file line counter
+        elif line.startswith("\\"):
+            pass  # "\ No newline at end of file" — diff annotation, not a real file line
         else:
             current_new_line += 1
 

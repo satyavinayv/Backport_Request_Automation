@@ -102,6 +102,100 @@ class TestExtractScenarioBlockIds:
         tc_ids, _, _ = extract_scenario_block_ids(FEATURE_CONTENT, [9999])
         assert tc_ids == []
 
+    def test_per_examples_section_tag_captured_when_row_modified(self):
+        # Real-world pattern: each Examples block within one Scenario Outline has its
+        # own @TestCase tag placed directly before the Examples: keyword (not before
+        # the Scenario Outline itself).  Modifying a checksum value in Examples row 1
+        # (section 1) must return TC-1111; modifying row 2 (section 2) must return TC-2222.
+        content = (
+            "Scenario Outline: Render <DocName>\n"
+            "  Given I upload <DocName>\n"
+            "  Then checksum is <Checksum>\n"
+            "\n"
+            "  @TestCase:TC-1111\n"
+            "  Examples:\n"
+            "    | DocName | Checksum |\n"
+            "    | audio1  | old_md5  |\n"  # line 8 — row 1
+            "\n"
+            "  @TestCase:TC-2222\n"
+            "  Examples:\n"
+            "    | DocName | Checksum |\n"
+            "    | audio2  | old_md5  |\n"  # line 13 — row 2
+        )
+        # Modifying row 1 only → TC-1111 returned, TC-2222 NOT returned
+        tc_ids_r1, _, blocks_r1 = extract_scenario_block_ids(content, [8])
+        assert "TC-1111" in tc_ids_r1
+        assert "TC-2222" not in tc_ids_r1
+        assert blocks_r1[0]["affected_rows"] == [1]
+
+        # Modifying row 2 only → TC-2222 returned, TC-1111 NOT returned
+        tc_ids_r2, _, blocks_r2 = extract_scenario_block_ids(content, [13])
+        assert "TC-2222" in tc_ids_r2
+        assert "TC-1111" not in tc_ids_r2
+        assert blocks_r2[0]["affected_rows"] == [2]
+
+        # Modifying both rows → both IDs returned with their respective rows
+        tc_ids_both, _, blocks_both = extract_scenario_block_ids(content, [8, 13])
+        assert "TC-1111" in tc_ids_both
+        assert "TC-2222" in tc_ids_both
+        ctx_map = {c["tc_id"]: c["row"] for c in blocks_both[0]["eval_contexts"]}
+        assert ctx_map["TC-1111"] == 1
+        assert ctx_map["TC-2222"] == 2
+
+    def test_per_examples_section_tag_with_comment_between_tag_and_examples(self):
+        # Real-world pattern: a comment line appears between the @TestCase tag(s) and
+        # the Examples: keyword.  The comment must NOT break the tag-collection walk-back.
+        content = (
+            "Scenario Outline: Render <DocName>\n"
+            "  Given I upload <DocName>\n"
+            "\n"
+            "  @TestCase:TC-ALPHA @TestCase:TC-BETA\n"
+            "  #comment about checksums\n"
+            "  Examples:\n"
+            "    | DocName | Checksum |\n"
+            "    | audio1  | old_md5  |\n"  # line 8 — row 1
+        )
+        tc_ids, _, blocks = extract_scenario_block_ids(content, [8])
+        assert "TC-ALPHA" in tc_ids
+        assert "TC-BETA" in tc_ids
+        assert blocks[0]["affected_rows"] == [1]
+
+    def test_multiple_testcase_annotations_on_same_line(self):
+        # @TestCase:ID1 @TestCase:ID2 on the same line — both must be extracted.
+        content = (
+            "Scenario Outline: Multi-tag\n"
+            "  Given something\n"
+            "\n"
+            "  @TestCase:TC-1111 @TestCase:TC-2222 @TestSuite:123\n"
+            "  Examples:\n"
+            "    | param |\n"
+            "    | value |\n"  # line 7 — row 1
+        )
+        tc_ids, _, blocks = extract_scenario_block_ids(content, [7])
+        assert "TC-1111" in tc_ids
+        assert "TC-2222" in tc_ids
+
+    def test_per_examples_section_tag_not_leaked_to_step_modification(self):
+        # Modifying a step (not an Examples row) returns ALL IDs — both TC-1111 and TC-2222
+        content = (
+            "Scenario Outline: Render <DocName>\n"
+            "  Given I upload <DocName>\n"          # line 2 — step, affects all rows
+            "\n"
+            "  @TestCase:TC-1111\n"
+            "  Examples:\n"
+            "    | DocName |\n"
+            "    | audio1  |\n"
+            "\n"
+            "  @TestCase:TC-2222\n"
+            "  Examples:\n"
+            "    | DocName |\n"
+            "    | audio2  |\n"
+        )
+        tc_ids, _, blocks = extract_scenario_block_ids(content, [2])
+        assert "TC-1111" in tc_ids
+        assert "TC-2222" in tc_ids
+        assert blocks[0]["affected_rows"] is None  # all rows
+
 
 class TestScanScenarioBlocks:
     def _make_change(self, path, diff="@@ -1,1 +1,1 @@\n+added line\n"):

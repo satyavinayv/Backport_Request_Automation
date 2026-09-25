@@ -206,3 +206,19 @@ class TestParseDiffModifiedLines:
 
     def test_empty_diff(self):
         assert parse_diff_modified_lines("") == []
+
+    def test_no_newline_annotation_not_counted_as_file_line(self):
+        # "\ No newline at end of file" is a diff annotation, not a real file line.
+        # It must NOT advance the new-file line counter — otherwise the next +line
+        # gets the wrong line number and row-matching in Examples tables breaks.
+        diff = (
+            "@@ -1,2 +1,2 @@\n"
+            " context\n"
+            "-old line\n"
+            "\\ No newline at end of file\n"
+            "+new line\n"
+            "\\ No newline at end of file\n"
+        )
+        lines = parse_diff_modified_lines(diff)
+        # context is line 1; +new line should be line 2, not line 3
+        assert lines == [2]

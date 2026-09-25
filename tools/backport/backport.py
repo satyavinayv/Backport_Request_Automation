@@ -72,6 +72,80 @@ class TestIdResult:
     skip_gm2_no_ids: bool
 
 
+def _build_eval_contexts(diff_details, all_tc_ids):
+    """
+    Build (tc_id, scenario_name, row) evaluation contexts from diff_details.
+
+    Phase 2 entries carry eval_contexts (pre-built per-block) plus scenario_name so
+    GM2 queries are scoped to the exact scenario and row that was changed.  This
+    prevents runs from a different scenario or a different outline row sharing the same
+    TC/Xray ID from influencing the eligibility verdict.
+
+    IDs that appear in all_tc_ids but have no Phase 2 eval_context (e.g. sourced from
+    Phase 1, Phase 3, MR description, or Phase 4) fall back to a plain
+    (tc_id, None, None) context — the existing full-ID query behaviour is preserved.
+
+    Per-Examples-section tags (e.g. @TestCase:537475183 placed directly above an
+    Examples: block rather than the Scenario Outline header) are handled by the block's
+    eval_contexts, which correctly map each TC ID to its specific row number so the
+    GM2 query is not polluted by other Examples sections sharing the same Scenario.
+    """
+    seen: set = set()
+    contexts = []
+    ids_with_scenario_ctx: set = set()
+
+    for detail in diff_details:
+        scenario_name = detail.get("scenario_name")       # None for Phase 1 / 3 / 4
+        block_eval_ctx = detail.get("eval_contexts", [])  # pre-built by scenario_parser
+
+        if block_eval_ctx and scenario_name is not None:
+            # Phase 2 block: use the precise (tc_id, row) pairs built during parsing.
+            # Each pair is already deduplicated and scoped to the affected Examples section.
+            for ctx in block_eval_ctx:
+                tid = ctx["tc_id"]
+                row = ctx.get("row")
+                ids_with_scenario_ctx.add(tid)
+                # Scenario Outline names in OpenSearch contain the substituted example values
+                # (e.g. "Render audiohalfsecond"), not the template ("Render <DocName>").
+                # Filtering by the template scenario_name would match nothing — use row only.
+                # For normal scenarios (row=None) the name is static and filters correctly.
+                effective_scenario = None if row is not None else scenario_name
+                key = (tid, effective_scenario, row)
+                if key not in seen:
+                    seen.add(key)
+                    contexts.append({"tc_id": tid, "scenario_name": effective_scenario, "row": row})
+        else:
+            # Phase 1 / 3 / 4 or no eval_contexts — fall back to flat ID list.
+            for tid in list(detail.get("tc_ids", [])) + list(detail.get("xray_ids", [])):
+                if scenario_name is not None:
+                    ids_with_scenario_ctx.add(tid)
+                key = (tid, scenario_name, None)
+                if key not in seen:
+                    seen.add(key)
+                    contexts.append({"tc_id": tid, "scenario_name": scenario_name, "row": None})
+
+    # Plain fallback for IDs not covered by any scenario-context entry
+    for tid in all_tc_ids:
+        if tid not in ids_with_scenario_ctx:
+            key = (tid, None, None)
+            if key not in seen:
+                seen.add(key)
+                contexts.append({"tc_id": tid, "scenario_name": None, "row": None})
+
+    return contexts
+
+
+def _format_ctx_label(ctx):
+    """Return a short parenthetical label for the eligibility report display."""
+    parts = []
+    if ctx.get("scenario_name"):
+        name = ctx["scenario_name"]
+        parts.append(f"scenario: {name[:60]}{'...' if len(name) > 60 else ''}")
+    if ctx.get("row") is not None:
+        parts.append(f"row: {ctx['row']}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id, jira_issue):
     """
     Extract TC/Xray IDs for a single MR through all fallback phases (1-4).
@@ -533,21 +607,31 @@ def main():
             for dtc in combined_deleted_tc_ids:
                 print(f"  {dtc}: [SKIPPED — test deleted in this MR]")
 
-        for tc_id in all_tc_ids:
+        # Build evaluation contexts: (tc_id, scenario_name, row) tuples sourced from
+        # Phase 2 diff_details.  IDs from other phases fall back to plain ID queries.
+        combined_diff_details = [d for rec in mr_records for d in rec.get("diff_details", [])]
+        eval_contexts = _build_eval_contexts(combined_diff_details, all_tc_ids)
+
+        for ctx in eval_contexts:
+            tc_id = ctx["tc_id"]
+            scenario_name = ctx.get("scenario_name")
+            row = ctx.get("row")
+            ctx_label = _format_ctx_label(ctx)
+
             if tc_id in per_tc_bypasses:
-                print(f"  {tc_id}: [BYPASSED] — {per_tc_bypasses[tc_id]}")
+                print(f"  {tc_id}{ctx_label}: [BYPASSED] — {per_tc_bypasses[tc_id]}")
                 continue
 
-            runs = fetch_gm2_runs(tc_id, merged_at_iso)
+            runs = fetch_gm2_runs(tc_id, merged_at_iso, scenario_name=scenario_name, row=row)
             eligible, reason, pattern_str = evaluate_eligibility(tc_id, runs)
             total_run_count += len(runs)
 
             if not eligible and not runs:
                 # Distinguish new test (no history) from CBB/rerun-only
-                absence = classify_gm2_absence(tc_id, merged_at_iso)
+                absence = classify_gm2_absence(tc_id, merged_at_iso, scenario_name=scenario_name, row=row)
 
                 if absence == "NO_HISTORY":
-                    print(f"  {tc_id}: [NEW TEST — NO GM2 HISTORY] -> [NOT ELIGIBLE]")
+                    print(f"  {tc_id}{ctx_label}: [NEW TEST — NO GM2 HISTORY] -> [NOT ELIGIBLE]")
                     print(f"    This test has no GM2 executions post-merge. Backport not recommended.")
                     print(f"    If urgent, use: --bypass-gm2-for {tc_id} --bypass-gm2-for-reason '<reason>'")
                     if not args.non_interactive and sys.stdin.isatty():
@@ -557,27 +641,28 @@ def main():
                         if confirm == "y":
                             br = input(f"    Enter bypass reason: ").strip() or "New test, urgent backport"
                             per_tc_bypasses[tc_id] = br
-                            print(f"    [BYPASSED] {tc_id}: {br}")
+                            print(f"    [BYPASSED] {tc_id}{ctx_label}: {br}")
                         else:
                             overall_eligible = False
                     else:
                         overall_eligible = False
 
                 else:  # CBB_RERUN_ONLY
-                    print(f"  {tc_id}: [NO NORMAL RUNS — ONLY CBB/RERUN FOUND]")
+                    print(f"  {tc_id}{ctx_label}: [NO NORMAL RUNS — ONLY CBB/RERUN FOUND]")
                     if not args.non_interactive and sys.stdin.isatty():
                         cbb_branch = input(
                             f"    Enter build_branches value to search CBB runs for {tc_id}"
                             f" (e.g. r26.2.3/user/QA-XXXXX), or press Enter to skip: "
                         ).strip()
                         if cbb_branch:
-                            cbb_runs = fetch_gm2_runs_cbb(tc_id, merged_at_iso, cbb_branch)
+                            cbb_runs = fetch_gm2_runs_cbb(tc_id, merged_at_iso, cbb_branch,
+                                                           scenario_name=scenario_name, row=row)
                             cbb_ok, cbb_reason, cbb_pattern = evaluate_eligibility_cbb(tc_id, cbb_runs)
                             if cbb_ok:
-                                print(f"    {tc_id} (CBB): {cbb_pattern} -> [ELIGIBLE via CBB]")
+                                print(f"    {tc_id}{ctx_label} (CBB): {cbb_pattern} -> [ELIGIBLE via CBB]")
                                 cbb_eligible_tcs[tc_id] = cbb_branch
                             else:
-                                print(f"    {tc_id} (CBB): {cbb_pattern} -> [NOT ELIGIBLE]")
+                                print(f"    {tc_id}{ctx_label} (CBB): {cbb_pattern} -> [NOT ELIGIBLE]")
                                 print(f"    Reason: {cbb_reason}")
                                 overall_eligible = False
                         else:
@@ -587,7 +672,7 @@ def main():
                         overall_eligible = False
 
             elif not eligible:
-                print(f"  {tc_id}: {pattern_str} -> [NOT ELIGIBLE]")
+                print(f"  {tc_id}{ctx_label}: {pattern_str} -> [NOT ELIGIBLE]")
                 print(f"    Reason: {reason}")
                 if not args.non_interactive and sys.stdin.isatty():
                     confirm = input(
@@ -598,13 +683,13 @@ def main():
                             f"    Enter bypass reason for {tc_id}: "
                         ).strip() or "User-confirmed bypass — known failure reason"
                         per_tc_bypasses[tc_id] = br
-                        print(f"    [BYPASSED] {tc_id}: {br}")
+                        print(f"    [BYPASSED] {tc_id}{ctx_label}: {br}")
                     else:
                         overall_eligible = False
                 else:
                     overall_eligible = False
             else:
-                print(f"  {tc_id}: {pattern_str} -> [ELIGIBLE]")
+                print(f"  {tc_id}{ctx_label}: {pattern_str} -> [ELIGIBLE]")
 
         print("-" * 40)
         has_special = bool(per_tc_bypasses or cbb_eligible_tcs)
