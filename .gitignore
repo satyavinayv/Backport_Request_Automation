@@ -3,7 +3,6 @@
 set_env.ps1
 *.env
 .env.*
-!.env.example
 
 # Python
 __pycache__/

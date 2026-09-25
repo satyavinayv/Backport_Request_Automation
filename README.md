@@ -156,7 +156,7 @@ $env:BACKPORT_LABELS   = 'team-qa'
 $env:BACKPORT_MANAGER_EMAIL = 'vinil.pokala@veeva.com'   # manager who approves the Jira comment
 $env:GITLAB_PROJECT_PATH    = 'veevavault/vaultautomationtests'  # project to search for test files
 
-# Pipeline/config repos where GM2 checks never apply (comma-separated repo names).
+# Pipeline/config repos where GM2 (TestCase/Xray ID) checks never apply (comma-separated repo names).
 # Default: "automation-platform-pipelines"
 # $env:BACKPORT_PIPELINE_PROJECTS = 'automation-platform-pipelines,infra-pipelines'
 ```

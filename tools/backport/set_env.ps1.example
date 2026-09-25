@@ -16,3 +16,9 @@ $env:GITLAB_PROJECT_PATH        = "veevavault/vaultautomationtests"
 # Comma-separated list of repo names (last part of the GitLab project path).
 # Default: "automation-platform-pipelines"
 # $env:BACKPORT_PIPELINE_PROJECTS = "automation-platform-pipelines,infra-pipelines"
+
+# Optional — auto-add these reviewers to every backport MR
+#$env:BACKPORT_REVIEWERS = 'john.doe,jane.smith'
+
+# Optional — add these labels to every backport MR (alongside original MR labels + "backport")
+#$env:BACKPORT_LABELS   = 'team-qa'
