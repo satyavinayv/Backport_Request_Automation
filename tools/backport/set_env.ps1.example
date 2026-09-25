@@ -9,5 +9,10 @@ $env:JIRA_PAT           = "your-jira-personal-access-token"
 $env:OPENSEARCH_URL     = "https://autoinfra-es.vaultdev.com:9200"
 
 # Optional overrides (defaults shown)
-$env:BACKPORT_MANAGER_EMAIL = "vinil.pokala@veeva.com"
-$env:GITLAB_PROJECT_PATH    = "veevavault/vaultautomationtests"
+$env:BACKPORT_MANAGER_EMAIL     = "vinil.pokala@veeva.com"
+$env:GITLAB_PROJECT_PATH        = "veevavault/vaultautomationtests"
+
+# Projects where GM2 is never applicable (pipeline/config repos).
+# Comma-separated list of repo names (last part of the GitLab project path).
+# Default: "automation-platform-pipelines"
+# $env:BACKPORT_PIPELINE_PROJECTS = "automation-platform-pipelines,infra-pipelines"

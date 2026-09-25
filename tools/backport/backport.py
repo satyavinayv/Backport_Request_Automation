@@ -37,8 +37,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import argparse
 import os
 import sys
+from dataclasses import dataclass, field
 
-from config import PROJECT_ID_ENCODED, JIRA_URL, BACKPORT_REVIEWERS, BACKPORT_LABELS
+from config import PROJECT_ID_ENCODED, JIRA_URL, BACKPORT_REVIEWERS, BACKPORT_LABELS, is_pipeline_project, pipeline_project_name
 from utils.log import err, warn, info
 from clients.gitlab import fetch_mr, fetch_mr_commits, get_current_user, resolve_usernames_to_ids
 from clients.jira import jira_post_comment
@@ -51,21 +52,31 @@ from features.id_extraction.repo_file_searcher import search_repo_for_file_usage
 from features.gm2_eligibility.runner import fetch_gm2_runs, classify_gm2_absence, fetch_gm2_runs_cbb
 from features.gm2_eligibility.evaluator import evaluate_eligibility, evaluate_eligibility_cbb
 from clients.gitlab import fetch_mr_file_changes
-from features.backport.branch_ops import create_backport_branch, cherry_pick_commit, delete_branch
+from features.backport.branch_ops import create_backport_branch, cherry_pick_commit, delete_branch, AlreadyAppliedError
 from features.backport.mr_ops import check_existing_backport_mr, create_mr, build_label_set
 from features.jira_workflow.issue import fetch_jira_issue, fetch_jira_issue_safe, get_fix_versions, get_caused_by_jira, parse_fix_version
 from features.jira_workflow.transitions import get_jira_status, transition_jira_issue, ensure_transition_to_mr_to_gm
 from features.jira_workflow.comment_builder import build_jira_comment
 
 
+@dataclass
+class TestIdResult:
+    tc_ids: list
+    xray_ids: list
+    id_source: str
+    diff_details: list
+    all_tc_ids: list
+    deleted_tc_ids: list
+    deleted_xray_ids: list
+    phase4_files_searched: list
+    skip_gm2_no_ids: bool
+
+
 def _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id, jira_issue):
     """
     Extract TC/Xray IDs for a single MR through all fallback phases (1-4).
     Also detects and returns TC IDs from deleted .feature files.
-
-    Returns:
-        tc_ids, xray_ids, id_source, diff_details, all_tc_ids,
-        deleted_tc_ids, deleted_xray_ids, phase4_files_searched, skip_gm2_no_ids
+    Returns a TestIdResult dataclass.
     """
     # Fetch raw file changes once — used for both deleted-file detection and Phase 4
     changes = fetch_mr_file_changes(PROJECT_ID_ENCODED, mr_iid)
@@ -157,9 +168,16 @@ def _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id
                     "    Xray IDs: DEV-XXXXX, DEV-YYYYY"
                 )
 
-    return (
-        tc_ids, xray_ids, id_source, diff_details, all_tc_ids,
-        deleted_tc_ids, deleted_xray_ids, phase4_files_searched, skip_gm2_no_ids,
+    return TestIdResult(
+        tc_ids=tc_ids,
+        xray_ids=xray_ids,
+        id_source=id_source,
+        diff_details=diff_details,
+        all_tc_ids=all_tc_ids,
+        deleted_tc_ids=deleted_tc_ids,
+        deleted_xray_ids=deleted_xray_ids,
+        phase4_files_searched=phase4_files_searched,
+        skip_gm2_no_ids=skip_gm2_no_ids,
     )
 
 
@@ -258,13 +276,25 @@ def main():
         caused_by_jira = get_caused_by_jira(jira_issue)
         info(f"!{mr_iid} ({jira_id}) Fix Versions: {', '.join(fix_versions)}")
 
-        (
-            tc_ids, xray_ids, id_source, diff_details, all_tc_ids,
-            mr_deleted_tc_ids, mr_deleted_xray_ids, phase4_files, skip_gm2_no_ids,
-        ) = _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id, jira_issue)
+        ids = _resolve_test_ids_for_mr(mr_iid, mr_title, mr_description, head_sha, jira_id, jira_issue)
+        tc_ids = ids.tc_ids
+        xray_ids = ids.xray_ids
+        id_source = ids.id_source
+        diff_details = ids.diff_details
+        all_tc_ids = ids.all_tc_ids
+        mr_deleted_tc_ids = ids.deleted_tc_ids
+        mr_deleted_xray_ids = ids.deleted_xray_ids
+        skip_gm2_no_ids = ids.skip_gm2_no_ids
 
         if not all_tc_ids and not skip_gm2_no_ids:
-            if not args.non_interactive and sys.stdin.isatty():
+            if is_pipeline_project():
+                info(
+                    f"Pipeline project detected ({pipeline_project_name()}) — GM2 check automatically skipped.\n"
+                    "  Pipeline/config repos contain no feature test annotations by design.\n"
+                    f"  Develop MR: {mr_web_url}"
+                )
+                skip_gm2_no_ids = True
+            elif not args.non_interactive and sys.stdin.isatty():
                 warn(
                     f"No Test Case or Xray IDs found via any method for MR !{mr_iid}.\n"
                     "  Checked: code diffs, scenario blocks, MR description, Jira description, repo file search."
@@ -404,15 +434,18 @@ def main():
     print("\n" + "=" * 60)
     print("  BACKPORT ELIGIBILITY REPORT")
     print("=" * 60)
+    if is_pipeline_project():
+        print(f"\nProject Type:  Pipeline/Config ({pipeline_project_name()}) — GM2 not applicable")
     for rec in mr_records:
-        print(f"\nMR:            !{rec['iid']}")
+        print(f"\nMR:            !{rec['iid']}  {rec['web_url']}")
         print(f"Title:         {rec['title']}")
         print(f"Author:        {rec['author']}")
         print(f"Merged At:     {rec['merged_at']}")
         print(f"Jira:          {rec['jira_id']}")
-        print(f"ID Source:     {rec['id_source'].upper()}")
-        print(f"Test Cases:    {', '.join(rec['tc_ids']) or 'none'}")
-        print(f"Xray IDs:      {', '.join(rec['xray_ids']) or 'none'}")
+        if not is_pipeline_project():
+            print(f"ID Source:     {rec['id_source'].upper()}")
+            print(f"Test Cases:    {', '.join(rec['tc_ids']) or 'none'}")
+            print(f"Xray IDs:      {', '.join(rec['xray_ids']) or 'none'}")
     if multi:
         print(f"\nCombined Test IDs ({len(all_tc_ids)}): {', '.join(all_tc_ids)}")
 
@@ -615,7 +648,10 @@ def main():
             if existing_mr_state == "opened":
                 warn(f"  Backport MR already open: {existing_mr['web_url']}")
             elif existing_mr_state == "merged":
-                warn(f"  Backport MR already merged: {existing_mr['web_url']}")
+                warn(
+                    f"  Backport MR already merged: {existing_mr['web_url']}\n"
+                    "  On --execute you will be asked whether to create another backport for this version."
+                )
             elif existing_mr_state == "closed":
                 warn(f"  Previously closed backport MR found: {existing_mr['web_url']} — will re-create on --execute.")
 
@@ -659,18 +695,54 @@ def main():
 
         existing_mr_obj, existing_mr_state = check_existing_backport_mr(PROJECT_ID_ENCODED, backport_branch, target_branch)
 
-        if existing_mr_obj and existing_mr_state in ("opened", "merged"):
-            backport_mr_url = existing_mr_obj["web_url"]
-            warn(f"Skipping MR creation — backport MR already {existing_mr_state}: {backport_mr_url}")
-        else:
-            if existing_mr_obj and existing_mr_state == "closed":
+        proceed_with_creation = True
+
+        if existing_mr_obj:
+            if existing_mr_state == "opened":
+                # Already open — skip creation but still post Jira comment below.
+                backport_mr_url = existing_mr_obj["web_url"]
+                warn(f"Skipping MR creation — backport MR already open: {backport_mr_url}")
+                proceed_with_creation = False
+
+            elif existing_mr_state == "merged":
+                # Already merged — ask whether to create another backport (e.g. previous fix incomplete).
+                warn(
+                    f"A backport MR for this branch was already merged: {existing_mr_obj['web_url']}\n"
+                    "  This could mean the previous fix did not fully resolve the issue,\n"
+                    "  or you are applying an additional change to the same release branch."
+                )
+                if args.non_interactive:
+                    warn("Non-interactive mode — skipping this version. Run interactively to create another backport.")
+                    continue  # skip Jira comment too — no new MR URL to reference
+                answer = input("  Create another backport MR for this version? (y/n): ").strip().lower()
+                if answer != "y":
+                    info(f"Skipping {fix_version_raw}.")
+                    continue  # skip Jira comment too
+                # Find an unused branch name by appending _v2, _v3, ...
+                suffix = 2
+                candidate = f"{backport_branch}_v{suffix}"
+                while check_existing_backport_mr(PROJECT_ID_ENCODED, candidate, target_branch)[0]:
+                    suffix += 1
+                    candidate = f"{backport_branch}_v{suffix}"
+                backport_branch = candidate
+                info(f"Creating new backport branch: {backport_branch}")
+
+            elif existing_mr_state == "closed":
                 warn(f"Re-creating backport MR — previous MR was closed: {existing_mr_obj['web_url']}")
+
+        if proceed_with_creation:
             create_backport_branch(PROJECT_ID_ENCODED, backport_branch, target_branch)
 
             conflict_occurred = False
+            already_applied_shas = []
             for c in commits_ordered:
                 try:
                     cherry_pick_commit(PROJECT_ID_ENCODED, c["id"], backport_branch)
+                except AlreadyAppliedError:
+                    already_applied_shas.append(c["id"][:8])
+                    warn(
+                        f"  Commit {c['id'][:8]} is already present in '{target_branch}' — skipping."
+                    )
                 except SystemExit:
                     conflict_occurred = True
                     info(f"Cleaning up branch '{backport_branch}' ...")
@@ -686,8 +758,26 @@ def main():
                 print(f"  Skipping {fix_version_raw} due to conflict. Moving to next version.")
                 continue
 
+            all_already_applied = (
+                len(already_applied_shas) > 0
+                and len(already_applied_shas) == len(commits_ordered)
+            )
+            if all_already_applied:
+                info(f"Cleaning up branch '{backport_branch}' — all commits already present ...")
+                delete_branch(PROJECT_ID_ENCODED, backport_branch)
+                warn(
+                    f"All commits are already present in '{target_branch}'.\n"
+                    "  The changes appear to have been backported previously.\n"
+                    "  Skipping MR creation. Jira comment and transitions will still be applied.\n"
+                    f"  Already applied: {', '.join(already_applied_shas)}"
+                )
+                backport_mr_url = primary_rec["web_url"]  # use develop MR as reference
+
+            # Skip MR creation if every commit was already present in the target branch.
+            if all_already_applied:
+                pass  # backport_mr_url already set to develop MR URL above
             # Build title and description
-            if multi:
+            elif multi:
                 title_suffixes = [rec["title"][len(rec["jira_id"]):].strip() for rec in mr_records]
                 combined_suffix = " | ".join(s for s in title_suffixes if s)
                 backport_title = f"{' '.join(jira_ids)} [Backport to {version_str}] {combined_suffix}"
@@ -722,24 +812,25 @@ def main():
                     f"Closes {rec['jira_id']}"
                 )
 
-            if combined_deleted_tc_ids:
-                backport_description += (
-                    f"\n\nNote: The following tests were deleted in this MR and skipped from GM2 check:\n"
-                    + "\n".join(f"  - {dtc}" for dtc in combined_deleted_tc_ids)
-                )
+            if not all_already_applied:
+                if combined_deleted_tc_ids:
+                    backport_description += (
+                        f"\n\nNote: The following tests were deleted in this MR and skipped from GM2 check:\n"
+                        + "\n".join(f"  - {dtc}" for dtc in combined_deleted_tc_ids)
+                    )
 
-            backport_mr = create_mr(
-                PROJECT_ID_ENCODED,
-                backport_branch,
-                target_branch,
-                backport_title,
-                backport_description,
-                assignee_id=assignee_id,
-                reviewer_ids=reviewer_ids if reviewer_ids else None,
-                labels=labels if labels else None,
-            )
-            backport_mr_url = backport_mr["web_url"]
-            info(f"Backport MR created: {backport_mr_url}")
+                backport_mr = create_mr(
+                    PROJECT_ID_ENCODED,
+                    backport_branch,
+                    target_branch,
+                    backport_title,
+                    backport_description,
+                    assignee_id=assignee_id,
+                    reviewer_ids=reviewer_ids if reviewer_ids else None,
+                    labels=labels if labels else None,
+                )
+                backport_mr_url = backport_mr["web_url"]
+                info(f"Backport MR created: {backport_mr_url}")
 
         # Post Jira comment to the primary (first) ticket only — the backport MR
         # description already closes all Jira IDs, so a single comment is enough.

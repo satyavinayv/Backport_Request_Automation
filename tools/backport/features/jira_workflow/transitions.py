@@ -34,7 +34,10 @@ def transition_jira_issue(jira_id, target_status):
     url = f"{JIRA_URL}/rest/api/2/issue/{jira_id}/transitions"
     payload = {"transition": {"id": str(transition_id)}}
 
-    resp = requests.post(url, headers=get_jira_headers(), json=payload, timeout=30)
+    try:
+        resp = requests.post(url, headers=get_jira_headers(), json=payload, timeout=30)
+    except requests.exceptions.ConnectionError as exc:
+        err(f"Cannot connect to Jira — check your VPN and JIRA_URL/JIRA_PAT.\nDetail: {exc}")
     if resp.status_code == 204:
         info(f"Jira {jira_id} transitioned to '{target_status}'")
         return True

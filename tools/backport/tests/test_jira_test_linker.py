@@ -222,6 +222,45 @@ class TestParseDescriptionForTableData:
         assert "11371" in tc_ids  # candidate — not yet validated
 
 
+class TestIsValidBodyRowBoundary:
+    """
+    The ±1 column-count guard means a multi-space-format body row is accepted only when
+    its column count is within one of the header's column count.
+    A prior bug had ±2 in the docstring and these tests would have caught it.
+    Tested indirectly via parse_description_for_table_data (multi-space header = 3 cols).
+    """
+
+    _HEADER = "API Version    Test ID/Xray ID    Scenario/Method"  # 3-column header
+
+    def _desc(self, body_line):
+        return f"{self._HEADER}\n{body_line}"
+
+    def test_exact_columns_accepted(self):
+        # 3 columns — exact match → accepted
+        _, xray_ids, _ = parse_description_for_table_data(self._desc("26.3    DEV-9991    Some scenario"))
+        assert "DEV-9991" in xray_ids
+
+    def test_minus_one_column_accepted(self):
+        # 2 columns (header - 1) → accepted (optional trailing column missing)
+        _, xray_ids, _ = parse_description_for_table_data(self._desc("26.3    DEV-9992"))
+        assert "DEV-9992" in xray_ids
+
+    def test_minus_two_columns_rejected(self):
+        # 1 column (header - 2) → rejected as free-text; with ±2 bug this would be accepted
+        _, xray_ids, _ = parse_description_for_table_data(self._desc("DEV-9993"))
+        assert "DEV-9993" not in xray_ids
+
+    def test_plus_one_column_accepted(self):
+        # 4 columns (header + 1) → accepted (extra optional column present)
+        _, xray_ids, _ = parse_description_for_table_data(self._desc("26.3    DEV-9994    Some scenario    extra"))
+        assert "DEV-9994" in xray_ids
+
+    def test_plus_two_columns_rejected(self):
+        # 5 columns (header + 2) → rejected; with ±2 bug this would be accepted
+        _, xray_ids, _ = parse_description_for_table_data(self._desc("26.3    DEV-9995    Some scenario    extra1    extra2"))
+        assert "DEV-9995" not in xray_ids
+
+
 class TestExtractIdsViaJiraScenarios:
     def _jira_issue(self, description):
         return {"fields": {"description": description}}

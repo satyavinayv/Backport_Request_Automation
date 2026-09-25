@@ -17,6 +17,26 @@ BACKPORT_REVIEWERS = os.environ.get("BACKPORT_REVIEWERS", "")
 # Can also be extended at runtime with --labels CLI flag.
 BACKPORT_LABELS = os.environ.get("BACKPORT_LABELS", "")
 
+# Comma-separated GitLab project names (last path component of GITLAB_PROJECT_PATH)
+# that contain pipeline/config files only — GM2 checks are never applicable for these.
+# Example: BACKPORT_PIPELINE_PROJECTS=automation-platform-pipelines,infra-pipelines
+_PIPELINE_PROJECT_NAMES = {
+    p.strip().lower()
+    for p in os.environ.get("BACKPORT_PIPELINE_PROJECTS", "automation-platform-pipelines").split(",")
+    if p.strip()
+}
+
+
+def is_pipeline_project():
+    """Return True when the configured project is a known pipeline/config repo."""
+    last_component = PROJECT_PATH.rstrip("/").split("/")[-1].lower()
+    return last_component in _PIPELINE_PROJECT_NAMES
+
+
+def pipeline_project_name():
+    """Return just the last path component of PROJECT_PATH (the repo name)."""
+    return PROJECT_PATH.rstrip("/").split("/")[-1]
+
 
 def get_gitlab_headers():
     """Read token fresh from env each call — safe even if env is set after module import."""
